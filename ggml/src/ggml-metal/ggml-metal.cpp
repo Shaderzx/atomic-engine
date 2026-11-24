@@ -1105,6 +1105,79 @@ static ggml_tensor * ggml_backend_metal_inkling_control_v1(ggml_context * ctx, g
     return node;
 }
 
+static ggml_tensor * ggml_backend_metal_inkling_mix_v1(ggml_context * ctx,
+        ggml_tensor * const * states, int n_states, ggml_tensor * query) {
+    if (!states || !query || n_states < 1 || n_states > 9 ||
+            query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query) ||
+            query->ne[0] <= 0 || query->ne[0] % 4 != 0 ||
+            query->ne[1] < 1 || query->ne[1] > 4 || query->ne[2] != 1 || query->ne[3] != 1) {
+        return nullptr;
+    }
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_q      = query->ne[1];
+    const int64_t n_tokens = states[0] ? states[0]->ne[1] : 0;
+    if (n_tokens <= 0) { return nullptr; }
+    ggml_tensor * args[10] = {};
+    for (int i = 0; i < n_states; ++i) {
+        auto * s = states[i];
+        if (!s || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
+                s->ne[0] != n_embd || s->ne[1] != n_tokens || s->ne[2] != 1 || s->ne[3] != 1) {
+            return nullptr;
+        }
+        args[i] = s;
+    }
+    args[n_states] = query;
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_q, 1, args, n_states + 1,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling depth mix requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3] = n_states;
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] = int32_t(n_q);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_MIX;
+    return node;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_ctrl_down_v1(ggml_context * ctx,
+        ggml_tensor * cur, ggml_tensor * message, ggml_tensor * w_down) {
+    if (!cur || !message || !w_down ||
+            cur->type != GGML_TYPE_F32 || message->type != GGML_TYPE_F32 || w_down->type != GGML_TYPE_Q8_0 ||
+            !ggml_is_contiguous(cur) || !ggml_is_contiguous(message) || !ggml_is_contiguous(w_down) ||
+            !ggml_are_same_shape(cur, message) || !ggml_is_matrix(cur) ||
+            cur->ne[0] <= 0 || cur->ne[0] % 32 != 0 || cur->ne[1] <= 0 ||
+            w_down->ne[0] != 2 * cur->ne[0] || w_down->ne[1] <= 0 || w_down->ne[1] > 256 ||
+            w_down->ne[2] != 1 || w_down->ne[3] != 1 ||
+            w_down->nb[1] != ggml_row_size(GGML_TYPE_Q8_0, w_down->ne[0])) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {cur, message, w_down};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, w_down->ne[1], cur->ne[1], 1, 1, args, 3,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling ctrl down requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_CTRL_DOWN;
+    return node;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_ctrl_apply_v1(ggml_context * ctx,
+        ggml_tensor * cur, ggml_tensor * message, ggml_tensor * gate,
+        ggml_tensor * w_gain, ggml_tensor * w_forget) {
+    if (!cur || !message || !gate || !w_gain || !w_forget ||
+            cur->type != GGML_TYPE_F32 || message->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            w_gain->type != GGML_TYPE_Q8_0 || w_forget->type != GGML_TYPE_Q8_0 ||
+            !ggml_is_contiguous(cur) || !ggml_is_contiguous(message) || !ggml_is_contiguous(gate) ||
+            !ggml_is_contiguous(w_gain) || !ggml_is_contiguous(w_forget) ||
+            !ggml_are_same_shape(cur, message) || !ggml_is_matrix(cur) || !ggml_is_matrix(gate) ||
+            cur->ne[0] <= 0 || cur->ne[1] <= 0 || gate->ne[1] != cur->ne[1] ||
+            gate->ne[0] <= 0 || gate->ne[0] > 256 || gate->ne[0] % 32 != 0 ||
+            w_gain->ne[0] != gate->ne[0] || w_gain->ne[1] != cur->ne[0] || w_gain->ne[2] != 1 || w_gain->ne[3] != 1 ||
+            !ggml_are_same_shape(w_gain, w_forget) ||
+            w_gain->nb[1] != ggml_row_size(GGML_TYPE_Q8_0, w_gain->ne[0]) ||
+            w_forget->nb[1] != ggml_row_size(GGML_TYPE_Q8_0, w_forget->ne[0])) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {cur, message, gate, w_gain, w_forget};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1], 1, 1, args, 5,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling ctrl apply requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_CTRL_APPLY;
+    return node;
+}
+
 static ggml_tensor * ggml_backend_metal_inkling_situ_v1(ggml_context * ctx, ggml_tensor * gate_up,
         float beta, float linear_beta) {
     if (gate_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_up) ||
@@ -1331,6 +1404,15 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_control_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_control_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_mix_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_mix_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_ctrl_down_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_ctrl_down_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_ctrl_apply_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_ctrl_apply_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_situ_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_situ_v1;

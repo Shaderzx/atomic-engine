@@ -35,6 +35,254 @@ kernel void kernel_inkling_situ(
     dst[p.y * width + p.x] = (curved * sigmoid) * up;
 }
 
+// Fused Inkling depth-attention residual mixer: replaces O(K) concat + rms_norm +
+// repeat + mul_mat + softmax + cont(transpose) + mul_mat with a single pass.
+// Output layout is [n_embd, n_tokens, n_q] so each query slice is contiguous.
+struct inkling_mix_args {
+    uint  n_embd;
+    uint  n_tokens;
+    uint  n_states;
+    uint  n_q;
+    float eps;
+    float scale;
+};
+
+kernel void kernel_inkling_mix(
+        constant inkling_mix_args & args [[buffer(0)]],
+        device const float4 * query      [[buffer(1)]],
+        device       float4 * dst        [[buffer(2)]],
+        device const float4 * s0         [[buffer(3)]],
+        device const float4 * s1         [[buffer(4)]],
+        device const float4 * s2         [[buffer(5)]],
+        device const float4 * s3         [[buffer(6)]],
+        device const float4 * s4         [[buffer(7)]],
+        device const float4 * s5         [[buffer(8)]],
+        device const float4 * s6         [[buffer(9)]],
+        device const float4 * s7         [[buffer(10)]],
+        device const float4 * s8         [[buffer(11)]],
+        uint   t     [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    if (t >= args.n_tokens) { return; }
+    device const float4 * st[9] = { s0, s1, s2, s3, s4, s5, s6, s7, s8 };
+    const uint n4 = args.n_embd / 4u;
+    const ulong row_off = ulong(t) * n4;
+
+    threadgroup float sh_red[5][8];
+    threadgroup float sh_inv[9];
+    threadgroup float sh_w[4][9];
+
+    for (uint k = 0; k < args.n_states; ++k) {
+        device const float4 * sk = st[k] + row_off;
+        float sq = 0.0f;
+        float dq[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+        for (uint i = tid; i < n4; i += 256u) {
+            const float4 v = sk[i];
+            sq += dot(v, v);
+            for (uint q = 0; q < args.n_q; ++q) {
+                dq[q] += dot(v, query[ulong(q) * n4 + i]);
+            }
+        }
+        sq = simd_sum(sq);
+        if (lane == 0) { sh_red[0][sg] = sq; }
+        for (uint q = 0; q < args.n_q; ++q) {
+            const float s = simd_sum(dq[q]);
+            if (lane == 0) { sh_red[1 + q][sg] = s; }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (tid == 0) {
+            float tot_sq = 0.0f;
+            for (uint j = 0; j < 8u; ++j) { tot_sq += sh_red[0][j]; }
+            const float inv = rsqrt(tot_sq / float(args.n_embd) + args.eps);
+            sh_inv[k] = inv;
+            for (uint q = 0; q < args.n_q; ++q) {
+                float tot_d = 0.0f;
+                for (uint j = 0; j < 8u; ++j) { tot_d += sh_red[1 + q][j]; }
+                sh_w[q][k] = tot_d * inv * args.scale;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        for (uint q = 0; q < args.n_q; ++q) {
+            float mx = sh_w[q][0];
+            for (uint k = 1; k < args.n_states; ++k) { mx = max(mx, sh_w[q][k]); }
+            float denom = 0.0f;
+            for (uint k = 0; k < args.n_states; ++k) {
+                const float e = exp(sh_w[q][k] - mx);
+                sh_w[q][k] = e;
+                denom += e;
+            }
+            const float inv_d = 1.0f / denom;
+            for (uint k = 0; k < args.n_states; ++k) {
+                sh_w[q][k] = (sh_w[q][k] * inv_d) * sh_inv[k];
+            }
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const ulong stride_q = ulong(args.n_tokens) * n4;
+    for (uint i = tid; i < n4; i += 256u) {
+        float4 acc[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+        for (uint k = 0; k < args.n_states; ++k) {
+            const float4 v = st[k][row_off + i];
+            for (uint q = 0; q < args.n_q; ++q) {
+                acc[q] = fma(float4(sh_w[q][k]), v, acc[q]);
+            }
+        }
+        for (uint q = 0; q < args.n_q; ++q) {
+            dst[ulong(q) * stride_q + row_off + i] = acc[q];
+        }
+    }
+}
+
+// Fused Inkling loop controller down-projection: rms_norm(cur) + rms_norm(msg) + concat + Q8_0 matvec.
+struct inkling_block_q8_0 {
+    half   d;
+    int8_t qs[32];
+};
+static_assert(sizeof(inkling_block_q8_0) == 34, "inkling_block_q8_0 must match GGML block_q8_0");
+
+struct inkling_ctrl_args {
+    uint  n_embd;
+    uint  rank;
+    uint  n_tokens;
+    float eps;
+};
+
+kernel void kernel_inkling_ctrl_down_q8_0(
+        constant inkling_ctrl_args & args        [[buffer(0)]],
+        device const float * cur                 [[buffer(1)]],
+        device const float * message             [[buffer(2)]],
+        device const inkling_block_q8_0 * w_down [[buffer(3)]],
+        device       float * dst                 [[buffer(4)]],
+        uint2  group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    const uint t = group.y;
+    if (t >= args.n_tokens) { return; }
+
+    const uint n4 = args.n_embd / 4u;
+    device const float4 * cur4 = (device const float4 *)(cur + ulong(t) * args.n_embd);
+    device const float4 * msg4 = (device const float4 *)(message + ulong(t) * args.n_embd);
+
+    threadgroup float sh_sq[2][8];
+    threadgroup float sh_inv[2];
+
+    float sq_c = 0.0f;
+    float sq_m = 0.0f;
+    for (uint i = tid; i < n4; i += 256u) {
+        const float4 vc = cur4[i];
+        const float4 vm = msg4[i];
+        sq_c += dot(vc, vc);
+        sq_m += dot(vm, vm);
+    }
+    sq_c = simd_sum(sq_c);
+    sq_m = simd_sum(sq_m);
+    if (lane == 0) {
+        sh_sq[0][sg] = sq_c;
+        sh_sq[1][sg] = sq_m;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        float tc = 0.0f, tm = 0.0f;
+        for (uint j = 0; j < 8u; ++j) {
+            tc += sh_sq[0][j];
+            tm += sh_sq[1][j];
+        }
+        sh_inv[0] = rsqrt(tc / float(args.n_embd) + args.eps);
+        sh_inv[1] = rsqrt(tm / float(args.n_embd) + args.eps);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint row = group.x * 8u + sg;
+    if (row >= args.rank) { return; }
+
+    const uint nb_half = args.n_embd / 32u;
+    device const inkling_block_q8_0 * w_row = w_down + ulong(row) * (2u * nb_half);
+    device const float * cur_row = cur + ulong(t) * args.n_embd;
+    device const float * msg_row = message + ulong(t) * args.n_embd;
+
+    const uint g = lane / 4u;
+    const uint p = (lane % 4u) * 8u;
+    float sum_c = 0.0f;
+    float sum_m = 0.0f;
+
+    for (uint ib = g; ib < nb_half; ib += 8u) {
+        const device inkling_block_q8_0 & bc = w_row[ib];
+        const device inkling_block_q8_0 & bm = w_row[nb_half + ib];
+        const device float4 * xc = (const device float4 *)(cur_row + ib * 32u + p);
+        const device float4 * xm = (const device float4 *)(msg_row + ib * 32u + p);
+        const float4 qc0 = float4(bc.qs[p + 0], bc.qs[p + 1], bc.qs[p + 2], bc.qs[p + 3]);
+        const float4 qc1 = float4(bc.qs[p + 4], bc.qs[p + 5], bc.qs[p + 6], bc.qs[p + 7]);
+        const float4 qm0 = float4(bm.qs[p + 0], bm.qs[p + 1], bm.qs[p + 2], bm.qs[p + 3]);
+        const float4 qm1 = float4(bm.qs[p + 4], bm.qs[p + 5], bm.qs[p + 6], bm.qs[p + 7]);
+        sum_c = fma(float(bc.d), dot(qc0, xc[0]) + dot(qc1, xc[1]), sum_c);
+        sum_m = fma(float(bm.d), dot(qm0, xm[0]) + dot(qm1, xm[1]), sum_m);
+    }
+
+    const float total = simd_sum(sum_c) * sh_inv[0] + simd_sum(sum_m) * sh_inv[1];
+    if (lane == 0) {
+        dst[ulong(t) * args.rank + row] = total;
+    }
+}
+
+// Fused Inkling loop controller up-projection + gating: Q8_0 gain & forget + precise tanh residual mix.
+kernel void kernel_inkling_ctrl_apply_q8_0(
+        constant inkling_ctrl_args & args          [[buffer(0)]],
+        device const float * cur                   [[buffer(1)]],
+        device const float * message               [[buffer(2)]],
+        device const float * gate                  [[buffer(3)]],
+        device const inkling_block_q8_0 * w_gain   [[buffer(4)]],
+        device const inkling_block_q8_0 * w_forget [[buffer(5)]],
+        device       float * dst                   [[buffer(6)]],
+        uint2  group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]]) {
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    const uint t = group.y;
+    if (t >= args.n_tokens) { return; }
+
+    threadgroup float sh_gate[256];
+    if (tid < args.rank) {
+        sh_gate[tid] = gate[ulong(t) * args.rank + tid];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint r = group.x * 256u + tid;
+    if (r >= args.n_embd) { return; }
+
+    const uint nb_r = args.rank / 32u;
+    device const inkling_block_q8_0 * bg_row = w_gain   + ulong(r) * nb_r;
+    device const inkling_block_q8_0 * bf_row = w_forget + ulong(r) * nb_r;
+
+    float g_acc = 0.0f;
+    float f_acc = 0.0f;
+    for (uint ib = 0; ib < nb_r; ++ib) {
+        const device inkling_block_q8_0 & bg = bg_row[ib];
+        const device inkling_block_q8_0 & bf = bf_row[ib];
+        float dg = 0.0f;
+        float df = 0.0f;
+        const uint base = ib * 32u;
+        for (uint j = 0; j < 32u; ++j) {
+            const float gv = sh_gate[base + j];
+            dg += float(bg.qs[j]) * gv;
+            df += float(bf.qs[j]) * gv;
+        }
+        g_acc += float(bg.d) * dg;
+        f_acc += float(bf.d) * df;
+    }
+
+    const ulong idx = ulong(t) * args.n_embd + r;
+    const float x = cur[idx];
+    const float forgotten = precise::tanh(f_acc) * x;
+    const float gained = precise::tanh(g_acc) * message[idx];
+    dst[idx] = (x - forgotten) + gained;
+}
+
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
 

@@ -20,6 +20,9 @@ enum { GGML_METAL_INKLING_CONTROL = 0x41544538 };
 enum { GGML_METAL_INKLING_VOCAB_ADD = 0x41545732 };
 enum { GGML_METAL_INKLING_PREFILL_ATTN = 0x41544539 };
 enum { GGML_METAL_INKLING_FLASH_ATTN = 0x4154453A };
+enum { GGML_METAL_INKLING_MIX = 0x4154453B };
+enum { GGML_METAL_INKLING_CTRL_DOWN = 0x4154453C };
+enum { GGML_METAL_INKLING_CTRL_APPLY = 0x4154453D };
 static inline bool ggml_metal_is_host_expert(const struct ggml_tensor * node) {
     return node->op == GGML_OP_CUSTOM &&
         node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_HOST_EXPERT_BRIDGE;

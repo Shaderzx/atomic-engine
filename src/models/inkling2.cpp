@@ -185,6 +185,18 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
 ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
+    if (inkling_dense_backend && mix_kernel && blocks.size() + 1 <= 9) {
+        ggml_tensor * st[9];
+        int n_st = 0;
+        for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
+            st[n_st++] = *it;
+        }
+        st[n_st++] = cur;
+        if (auto * fused = mix_kernel(ctx0, st, n_st, query)) {
+            ggml_backend_sched_set_tensor_backend(sched, fused, inkling_dense_backend);
+            return fused;
+        }
+    }
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
     for (ggml_tensor * block : blocks) {
         states = ggml_concat(ctx0, ggml_reshape_3d(ctx0, block, n_embd, 1, n_tokens), states, 1);
@@ -254,6 +266,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
+    if (inkling_dense_backend && ctrl_down_kernel && ctrl_apply_kernel && n_tokens <= 8 && (!loras || loras->empty())) {
+        if (auto * gate = ctrl_down_kernel(ctx0, cur, message, loop.ctrl_down[ctrl])) {
+            ggml_backend_sched_set_tensor_backend(sched, gate, inkling_dense_backend);
+            if (auto * out = ctrl_apply_kernel(ctx0, cur, message, gate, loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl])) {
+                ggml_backend_sched_set_tensor_backend(sched, out, inkling_dense_backend);
+                return out;
+            }
+        }
+    }
     ggml_tensor * gate = ggml_concat(ctx0, ggml_rms_norm(ctx0, cur, 1e-6f), ggml_rms_norm(ctx0, message, 1e-6f), 0);
     gate = build_lora_mm(loop.ctrl_down[ctrl], gate);
 
@@ -348,6 +369,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
+        if (messages->op == GGML_OP_CUSTOM) {
+            return ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[1], ctrl*messages->nb[2]);
+        }
         return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
     };
 
@@ -361,8 +385,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
         ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        for (int j = 0; j < 3; ++j) {
-            inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+        if (mixed->op == GGML_OP_CUSTOM) {
+            if (is_swa) {
+                ggml_tensor * s = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], 0);
+                inputs[0] = inputs[1] = inputs[2] = s;
+            } else {
+                for (int j = 0; j < 3; ++j) {
+                    inputs[j] = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], j*mixed->nb[2]);
+                }
+            }
+        } else {
+            for (int j = 0; j < 3; ++j) {
+                inputs[j] = ggml_cont(ctx0, ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[2], (is_swa ? 0 : j)*mixed->nb[1]));
+            }
         }
     }
 

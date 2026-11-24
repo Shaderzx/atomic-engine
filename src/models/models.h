@@ -2547,6 +2547,9 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * tau         = nullptr; // log-scaled positions
         ggml_backend_t inkling_dense_backend = nullptr;
         ggml_tensor * (*control_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
+        ggml_tensor * (*mix_kernel)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *) = nullptr;
+        ggml_tensor * (*ctrl_down_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
+        ggml_tensor * (*ctrl_apply_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*clip_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, float) = nullptr;
         ggml_tensor * (*rel_mask_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*conv_residual_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float) = nullptr;

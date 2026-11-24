@@ -45,3 +45,9 @@
 | `w2-fused` | Wave 2 resident fused kernels (`control`, `clip`, `conv`, `situ`, `vocab_add`) | 37.90 (+8.1%) | 731.9 (+11.7%) | 649.2 (60.0s, 2.89x) | — | 152.5 | 1.53 | 20.49 | **ACCEPTED**: +8.1% c1, +11.7% 4K, 2.89x 32K vs base |
 | `ctl-w2-off` (B) | Wave 2 control (`LLAMA_INKLING_FUSED_KERNELS=0`) | 35.33 | 657.8 | — | — | 174.8 | 1.53 | 20.47 | Interleaved control B |
 | `w2-fused-nospec` | Wave 2 resident fused kernels, `-c 262144`, no spec | **38.18** (+21.2%) | **771.2** (+106%) | — | — | 142.2 | 1.02 | 18.71 | Plain nospec now beats unmodified DSpark 3/32! |
+| `ctl-w3-off` (A/B) | Wave 3 control (`LLAMA_INKLING_GROUP_MOE=0`) | 37.29 / 37.94 | 746.6 / 750.4 | — | — | 150.4 | 1.53 | 20.18 | Interleaved controls (`mean_len=2.07–2.11`) |
+| `w3-group-moe` | Wave 3 grouped MoE (`Q4_K` + `Q5_0`, `n=2..16`) | 36.51 (-3.0%) | 749.7 | — | — | 157.4 | 1.52 | 20.17 | **REJECTED & REVERTED**: bit-exact greedy match, but 96 `concurrency_reset` barriers + `nr0=1` lost +2.7 ms/round (`pp4` 87.6 vs 94.1 tok/s). |
+| `w3-group-moe-n5` | Wave 3 grouped MoE with `--spec-draft-n-max 5` | 30.52 | 747.7 | — | — | 173.9 | 1.52 | 20.18 | **REJECTED**: `mean_len` only 2.12->2.21 while draft+verify cost rose sharply. |
+| `ctl-w3b-off` (A/B) | Wave 3B control (`FUSED_MIX=0 FUSED_CTRL=0`) | 37.97 / 38.55 | 750.2 / 750.3 | — | — | 152.0 | 1.78 | 20.19 | Interleaved controls |
+| `w3b-mix-ctrl` | Wave 3B fused `mix()` + fused `control()` Q8_0 (`-c 262144`, DSpark 3/32) | **39.68** (+3.7%) | **921.9** (+22.9%) | **801.0** (48.6s, **3.57x**) | — | 141.4 | 1.53 | 20.19 | **ACCEPTED**: cuts ~1,860 dispatches/tok; 32K prefill 173.7s -> 48.6s! |
+| `w3b-mix-ctrl-nospec` | Wave 3B fused `mix()` + `control()`, `-c 262144`, no spec | **43.10** (+36.9% vs base) | **967.3** (**2.59x**) | — | — | **129.6** | 1.02 | 18.38 | **ACCEPTED**: M=1 plain decode jumps 38.18 -> 43.10 tok/s (+12.9%)! |
