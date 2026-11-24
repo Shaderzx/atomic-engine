@@ -1,0 +1,51 @@
+{
+  "name": "ctl-w2-off",
+  "base_url": "http://127.0.0.1:8081",
+  "model": "inkling-2-mini",
+  "temperature": 0.0,
+  "extra_body": {
+    "chat_template_kwargs": {
+      "reasoning_effort": "none"
+    }
+  },
+  "prefill_lengths": [4096],
+  "require_ac": true,
+  "pid_file": "/tmp/inkling-bench-server.pid",
+  "log_file": "/tmp/inkling-bench-ctl-w2-off.log",
+  "memory": {
+    "cap_gib": 46,
+    "probe": ["bash", "/Users/shadmehr/code/atomic-engine/bench/m5pro-inkling-256k/mem_macos.sh", "/tmp/inkling-bench-server.pid"],
+    "interval_s": 2
+  },
+  "env": {
+    "LLAMA_INKLING_FUSED_KERNELS": "0",
+    "LLAMA_EXPERIMENTAL_INKLING_W2_PARALLEL_ADD": "0"
+  },
+  "cmd": [
+    "/Users/shadmehr/code/atomic-engine/build-metal-release/bin/llama-server",
+    "-m", "/Users/shadmehr/models/Inkling-2-Mini-GGUF/Inkling-2-Mini-AD-Q4_K.gguf",
+    "-md", "/Users/shadmehr/models/Inkling-2-Mini-GGUF/atomicchat-dspark-3095098/dspark-Inkling-2-Mini-Q8_0.gguf",
+    "--spec-type", "draft-dspark",
+    "--spec-draft-n-max", "3",
+    "--spec-draft-n-ubatch", "32",
+    "-fit", "off",
+    "-c", "262144",
+    "-b", "1024",
+    "-ub", "1024",
+    "-np", "1",
+    "-fa", "on",
+    "-ctk", "q4_0",
+    "-ctv", "q4_0",
+    "-ctkd", "q4_0",
+    "-ctvd", "q4_0",
+    "-ngl", "all",
+    "-ngld", "99",
+    "-t", "8",
+    "-tb", "8",
+    "--jinja",
+    "--metrics",
+    "--alias", "inkling-2-mini",
+    "--host", "127.0.0.1",
+    "--port", "8081"
+  ]
+}

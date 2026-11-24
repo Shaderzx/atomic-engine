@@ -1417,8 +1417,20 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_base()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos->buffer) {
+    if (self_rel_pos && self_rel_pos->buffer) {
         attn_ctx->get_base()->set_input_relative_pos(self_rel_pos, ubatch, extent);
+    }
+
+    if (self_q_pos && self_q_pos->buffer) {
+        std::vector<int32_t> qpos(ubatch->n_tokens);
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            qpos[i] = ubatch->pos[i];
+        }
+        ggml_backend_tensor_set(self_q_pos, qpos.data(), 0, ggml_nbytes(self_q_pos));
+    }
+
+    if (self_k_pos && self_k_pos->buffer) {
+        attn_ctx->get_base()->set_input_k_pos(self_k_pos, ubatch);
     }
 
     // swa tensors may not be allocated if there are no SWA attention layers
@@ -1431,8 +1443,12 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
 
-    if (self_rel_pos_swa->buffer) {
+    if (self_rel_pos_swa && self_rel_pos_swa->buffer) {
         attn_ctx->get_swa()->set_input_relative_pos(self_rel_pos_swa, ubatch, extent_swa);
+    }
+
+    if (self_k_pos_swa && self_k_pos_swa->buffer) {
+        attn_ctx->get_swa()->set_input_k_pos(self_k_pos_swa, ubatch);
     }
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
@@ -1457,27 +1473,29 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
 
     const auto * attn_ctx = mctx->get_attn();
 
-    // the masks are always dense, see build_inp_mem_hybrid_iswa_rel()
-
     // base tensors may not be allocated if there are no non-SWA attention layers
     if (inp_attn->self_k_idxs && inp_attn->self_k_idxs->buffer) {
         res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
     }
 
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
-
-    res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-    res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+    if (self_k_pos) {
+        res &= params.ubatch.n_seqs == 1 && params.cparams.causal_attn;
+        res &= self_q_pos->ne[0] == params.ubatch.n_tokens;
+        res &= self_k_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_k_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+    } else {
+        res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
+        res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
+        res &= self_rel_pos->ne[1] == params.ubatch.n_tokens;
+        res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
+        res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
+    }
 
     // swa tensors may not be allocated if there are no SWA attention layers
     if (inp_attn->self_k_idxs_swa && inp_attn->self_k_idxs_swa->buffer) {
         res &= inp_attn->self_k_idxs_swa->ne[0] == params.ubatch.n_tokens;
     }
-
-    res &= can_reuse_kq_mask(inp_attn->self_attn_mask_swa.raw, attn_ctx->get_swa(), params.ubatch, params.cparams);
-
-    res &= self_rel_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
-    res &= self_rel_pos_swa->ne[1] == params.ubatch.n_tokens;
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2667,6 +2685,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         ggml_tensor * up = nullptr;
+        ggml_tensor * gate_up_fused = nullptr;
 
         if (gate_up_exps) {
             // merged gate_up path: one mul_mat_id, then split into gate and up views
@@ -2682,6 +2701,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 cb(gate_up, "ffn_moe_gate_up_biased", il);
             }
 
+            gate_up_fused = gate_up;
             const int64_t n_ff = gate_up->ne[0] / 2;
             cur = ggml_view_3d(ctx0, gate_up, n_ff, gate_up->ne[1], gate_up->ne[2], gate_up->nb[1], gate_up->nb[2], 0);
             cb(cur, "ffn_moe_gate", il);
@@ -2758,12 +2778,38 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                     const float beta = hparams.situ_beta;
                     const float lb   = hparams.situ_linear_beta;
 
-                    ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
-                    act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
-                    if (lb > 0.0f) {
-                        up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                    ggml_tensor * fused = nullptr;
+                    const char * fused_env = std::getenv("LLAMA_INKLING_FUSED_KERNELS");
+                    if (gate_up_fused && (!fused_env || std::strcmp(fused_env, "0") != 0) &&
+                            model.dev_output() && std::strcmp(ggml_backend_dev_name(model.dev_output()), "MTL0") == 0 &&
+                            model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all) {
+                        const auto reg = ggml_backend_dev_backend_reg(model.dev_output());
+                        const auto situ_fn = reinterpret_cast<ggml_tensor * (*)(ggml_context *, ggml_tensor *, float, float)>(
+                                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_situ_v1"));
+                        if (situ_fn) {
+                            fused = situ_fn(ctx0, gate_up_fused, beta, lb);
+                            if (fused) {
+                                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                                    auto backend = ggml_backend_sched_get_backend(sched, i);
+                                    if (ggml_backend_get_device(backend) == model.dev_output()) {
+                                        ggml_backend_sched_set_tensor_backend(sched, fused, backend);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
                     }
-                    cur = ggml_mul(ctx0, act, up);
+
+                    if (fused) {
+                        cur = fused;
+                    } else {
+                        ggml_tensor * act = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/beta)), beta);
+                        act = ggml_mul(ctx0, act, ggml_sigmoid(ctx0, cur));
+                        if (lb > 0.0f) {
+                            up = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, up, 1.0f/lb)), lb);
+                        }
+                        cur = ggml_mul(ctx0, act, up);
+                    }
                     cb(cur, "ffn_moe_situ", il);
                 } break;
             case LLM_FFN_GELU:
@@ -3881,7 +3927,14 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * v_mla,
             float     kq_scale,
             int       il,
-        const llm_inkling_prefill_attention * prefill = nullptr) {
+        const llm_inkling_prefill_attention * prefill = nullptr,
+        const llm_inkling_flash_attention * flash = nullptr,
+        ggml_tensor * flash_table = nullptr,
+        ggml_tensor * flash_sinks = nullptr,
+        ggml_tensor * flash_q_pos = nullptr,
+        ggml_tensor * flash_k_pos = nullptr,
+        int32_t       flash_extent = 0,
+        int32_t       flash_n_swa = 0) {
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -3948,7 +4001,15 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * v = use_kv_cur ? v_cur : mctx_cur->get_v(ctx0, il);
 
     ggml_tensor * cur = nullptr;
-    if (prefill && prefill->create) {
+    if (flash && flash->create) {
+        cur = flash->create(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos, kq_scale, flash_extent, flash_n_swa);
+        if (cur && ggml_backend_supports_op(flash->backend, cur)) {
+            ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
+        } else {
+            cur = nullptr;
+        }
+    }
+    if (!cur && prefill && prefill->create) {
         cur = prefill->create(ctx0, q, k, v, kq_mask, kq_scale);
         if (cur && ggml_backend_supports_op(prefill->backend, cur)) {
             ggml_backend_sched_set_tensor_backend(gctx.sched, cur, prefill->backend);
@@ -4543,7 +4604,8 @@ llm_graph_input_mem_hybrid_iswa * llm_graph_context::build_inp_mem_hybrid_iswa()
 
 llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_iswa_rel(
         uint32_t extent,
-        uint32_t extent_swa) const {
+        uint32_t extent_swa,
+        bool     fused_rel_attn) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
 
     auto inp_rs = build_rs_inp_impl(ctx0, ubatch, mctx_cur->get_recr());
@@ -4557,14 +4619,18 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
         inp_attn->self_k_idxs = attn_ctx->get_base()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs = attn_ctx->get_base()->build_input_v_idxs(ctx0, ubatch);
 
-        inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        if (!fused_rel_attn) {
+            inp_attn->self_attn_mask.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_base(), ubatch, cparams);
+        }
     }
 
     {
         inp_attn->self_k_idxs_swa = attn_ctx->get_swa()->build_input_k_idxs(ctx0, ubatch);
         inp_attn->self_v_idxs_swa = attn_ctx->get_swa()->build_input_v_idxs(ctx0, ubatch);
 
-        inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+        if (!fused_rel_attn) {
+            inp_attn->self_attn_mask_swa.raw = build_attn_inp_kq_mask(ctx0, attn_ctx->get_swa(), ubatch, cparams);
+        }
     }
 
     inp_attn->self_k_rot = attn_ctx->get_base()->get_k_rot();
@@ -4575,13 +4641,27 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
-    inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos);
-    ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+    if (fused_rel_attn) {
+        inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        ggml_set_input(inp->self_q_pos);
+        ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
 
-    inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
-    ggml_set_input(inp->self_rel_pos_swa);
-    ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+        inp->self_k_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+        ggml_set_input(inp->self_k_pos);
+        ggml_set_name(inp->self_k_pos, "attn_inp_k_pos");
+
+        inp->self_k_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+        ggml_set_input(inp->self_k_pos_swa);
+        ggml_set_name(inp->self_k_pos_swa, "attn_inp_k_pos_swa");
+    } else {
+        inp->self_rel_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos);
+        ggml_set_name(inp->self_rel_pos, "attn_inp_rel_pos");
+
+        inp->self_rel_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv(), ubatch.n_tokens);
+        ggml_set_input(inp->self_rel_pos_swa);
+        ggml_set_name(inp->self_rel_pos_swa, "attn_inp_rel_pos_swa");
+    }
 
     return (llm_graph_input_mem_hybrid_iswa_rel *) res->add_input(std::move(inp));
 }
@@ -4602,6 +4682,15 @@ ggml_tensor * llm_graph_context::build_attn(
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
+
+    if (inp->flash_attention.create && inp->self_k_pos) {
+        ggml_tensor * k_pos = is_swa ? inp->self_k_pos_swa : inp->self_k_pos;
+        const int32_t extent = (int32_t)(is_swa ? inp->extent_swa : inp->extent);
+        const int32_t n_swa  = is_swa ? (int32_t)hparams.n_swa : 0;
+        return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
+                nullptr, nullptr, nullptr, nullptr, nullptr, kq_scale, il, nullptr,
+                &inp->flash_attention, kq_b, sinks, inp->self_q_pos, k_pos, extent, n_swa);
+    }
 
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
 

@@ -780,6 +780,13 @@ struct llm_inkling_prefill_attention {
     ggml_tensor * (*create)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float) = nullptr;
 };
 
+// Optional backend operation for Inkling on-the-fly relative-bias FlashAttention (prefill + decode, zero kq_b).
+struct llm_inkling_flash_attention {
+    ggml_backend_t backend = nullptr;
+    ggml_tensor * (*create)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
+            ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, int32_t, int32_t) = nullptr;
+};
+
 // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
 // the KQ masks are always dense (rows == nullptr) and are filled from the same cells as the distances, so that the bias
 // gathered by distance lines up with the mask
@@ -799,6 +806,7 @@ public:
         cparams(cparams),
         mctx(mctx) { }
     llm_inkling_prefill_attention prefill_attention;
+    llm_inkling_flash_attention   flash_attention;
 
     virtual ~llm_graph_input_mem_hybrid_iswa_rel() = default;
 
@@ -815,6 +823,11 @@ public:
     // distance from the token to the cell, extent for the empty, future and more distant cells
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
+
+    // 1D position inputs for on-the-fly relative-bias FlashAttention (eliminates 2D mask/rel_pos tensors)
+    ggml_tensor * self_q_pos       = nullptr; // I32 [n_batch]
+    ggml_tensor * self_k_pos       = nullptr; // I32 [n_kv]
+    ggml_tensor * self_k_pos_swa   = nullptr; // I32 [n_kv_swa]
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -1562,7 +1575,8 @@ struct llm_graph_context {
     // extent, extent_swa: the distance that the bias tables of the full and the SWA layers stop at
     llm_graph_input_mem_hybrid_iswa_rel * build_inp_mem_hybrid_iswa_rel(
             uint32_t extent,
-            uint32_t extent_swa) const;
+            uint32_t extent_swa,
+            bool     fused_rel_attn = false) const;
 
     // kq_b is added to the KQ mask, after the KQ scale
     ggml_tensor * build_attn(

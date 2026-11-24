@@ -3,9 +3,10 @@
 kernel void kernel_inkling_control(
         device const float * cur, device const float * message,
         device const float * gain, device const float * forget,
-        device float * output, uint i [[thread_position_in_grid]]) {
+        device float * output, constant uint & n_elems, uint i [[thread_position_in_grid]]) {
     #pragma clang fp contract(off)
     #pragma clang fp reassociate(off)
+    if (i >= n_elems) { return; }
     const float x = cur[i];
     const float forgotten = precise::tanh(forget[i]) * x;
     const float gained = precise::tanh(gain[i]) * message[i];

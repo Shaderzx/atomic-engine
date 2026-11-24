@@ -1587,6 +1587,9 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             return op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_REL_MASK ||
                    (op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_PREFILL_ATTN &&
                     has_simdgroup_mm && dev->props.max_theadgroup_memory_size >= 32768) ||
+                   (op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_FLASH_ATTN &&
+                    dev->props.max_theadgroup_memory_size >= 32768 &&
+                    (op->src[0]->ne[2] < 16 || dev->props.has_tensor)) ||
                 op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CONTROL ||
                 op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CONV_RESIDUAL ||
                 op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CLIP ||

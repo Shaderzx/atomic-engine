@@ -79,16 +79,20 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
     const auto & m = static_cast<const llama_model_inkling2_loop &>(model);
     const int start = m.core_start;
     const int end   = m.core_end;
-    if (expert_executor && n_tokens <= 8 && n_outputs == n_tokens) {
+    const char * fused_env = std::getenv("LLAMA_INKLING_FUSED_KERNELS");
+    const bool resident_fused = !expert_executor && model.devices.size() == 1 &&
+            model.n_gpu_layers() > hparams.n_layer_all && !llama_expert_acceleration_off() &&
+            (!fused_env || std::strcmp(fused_env, "0") != 0);
+    if (resident_fused || (expert_executor && n_tokens <= 8 && n_outputs == n_tokens)) {
         const char * rel_mask = std::getenv("LLAMA_EXPERIMENTAL_INKLING_REL_MASK");
         const char * convolution = std::getenv("LLAMA_EXPERIMENTAL_INKLING_CONV_RESIDUAL");
         const char * clip = std::getenv("LLAMA_EXPERIMENTAL_INKLING_CLIP");
         const bool use_rel = cparams.flash_attn && rel_mask && std::strcmp(rel_mask, "1") == 0;
-        const bool use_conv = convolution && std::strcmp(convolution, "1") == 0;
-        const bool use_clip = clip && std::strcmp(clip, "1") == 0;
+        const bool use_conv = resident_fused ? (ubatch.n_seqs == 1) : (convolution && std::strcmp(convolution, "1") == 0);
+        const bool use_clip = resident_fused || (clip && std::strcmp(clip, "1") == 0);
         const auto device = model.dev_output();
         const char * control = std::getenv("LLAMA_EXPERIMENTAL_INKLING_CONTROL");
-        const bool use_control = n_tokens == 4 && model.devices.size() == 1 &&
+        const bool use_control = (resident_fused || n_tokens == 4) && model.devices.size() == 1 &&
                 model.n_gpu_layers() > hparams.n_layer_all && !llama_expert_acceleration_off() &&
                 (!control || std::strcmp(control, "1") == 0);
         if ((use_rel || use_conv || use_clip || use_control) &&

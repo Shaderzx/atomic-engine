@@ -309,7 +309,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     tie_rank = ggml_scale_bias(ctx0, tie_rank, -1.0f, hparams.n_vocab_unpadded);
     auto * prev = ids;
     inkling_mark_add mark_add = nullptr;
-    if (model.dspark_markov_w2 && model.memory_contract && nb == 1) {
+    if (model.dspark_markov_w2 && nb == 1 && model.dev_output()) {
         const auto * opt = std::getenv("LLAMA_EXPERIMENTAL_INKLING_W2_PARALLEL_ADD");
         if (!opt || std::strcmp(opt, "1") == 0) {
             auto reg = ggml_backend_dev_backend_reg(model.dev_output());

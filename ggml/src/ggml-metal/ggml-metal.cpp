@@ -336,6 +336,13 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             {
                 res += ggml_metal_op_argmax_extra(tensor);
             } break;
+        case GGML_OP_CUSTOM:
+            {
+                if (tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_FLASH_ATTN &&
+                        tensor->src[0] && tensor->src[0]->ne[2] < 16) {
+                    res = GGML_PAD(res, 64) + (size_t)32 * 24 * (size_t)tensor->src[0]->ne[2] * 130 * sizeof(float);
+                }
+            } break;
         default:
             break;
     }
@@ -1086,7 +1093,7 @@ static void ggml_backend_metal_mark_inkling_group_bank(ggml_tensor * weight) {
 static ggml_tensor * ggml_backend_metal_inkling_control_v1(ggml_context * ctx, ggml_tensor * cur,
         ggml_tensor * message, ggml_tensor * gain, ggml_tensor * forget) {
     ggml_tensor * args[] = {cur, message, gain, forget};
-    if (cur->ne[0] != 2304 || cur->ne[1] != 4 || !ggml_is_matrix(cur)) { return nullptr; }
+    if (cur->ne[0] <= 0 || cur->ne[1] <= 0 || !ggml_is_matrix(cur)) { return nullptr; }
     for (auto * arg : args) {
         if (arg->type != GGML_TYPE_F32 || !ggml_are_same_shape(arg, cur) || !ggml_is_contiguous(arg)) {
             return nullptr;
@@ -1102,12 +1109,12 @@ static ggml_tensor * ggml_backend_metal_inkling_situ_v1(ggml_context * ctx, ggml
         float beta, float linear_beta) {
     if (gate_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_up) ||
             gate_up->ne[0] <= 0 || gate_up->ne[0] > 16384 || gate_up->ne[0] % 8 != 0 ||
-            gate_up->ne[1] <= 0 || gate_up->ne[1] > 64 || ggml_nrows(gate_up) != gate_up->ne[1] ||
+            gate_up->ne[1] <= 0 || gate_up->ne[3] != 1 || ggml_nrows(gate_up) <= 0 ||
             beta <= 0.0f || linear_beta < 0.0f || !std::isfinite(beta) || !std::isfinite(linear_beta)) {
         return nullptr;
     }
     ggml_tensor * args[] = {gate_up};
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, gate_up->ne[0] / 2, gate_up->ne[1], 1, 1,
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, gate_up->ne[0] / 2, gate_up->ne[1], gate_up->ne[2], 1,
             args, 1, +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling SiTU requires Metal"); }, 1, nullptr);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3, beta);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, linear_beta);
@@ -1179,6 +1186,45 @@ static ggml_tensor * ggml_backend_metal_inkling_prefill_attention_v1(ggml_contex
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, scale);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_PREFILL_ATTN;
     ggml_set_name(node, "inkling_prefill_attention");
+    return node;
+}
+
+static bool ggml_backend_metal_inkling_flash_attn_ready_v1(ggml_backend_t backend, int64_t n_q, ggml_type kv_type) {
+    if (!ggml_backend_is_metal(backend)) { return false; }
+    const auto dev = (ggml_metal_device_t) ggml_backend_get_device(backend)->context;
+    const auto * props = ggml_metal_device_get_props(dev);
+    if (!props || props->max_theadgroup_memory_size < 32768) { return false; }
+    if (kv_type != GGML_TYPE_F16 && kv_type != GGML_TYPE_Q8_0 && kv_type != GGML_TYPE_Q4_0) { return false; }
+    return n_q < 16 || props->has_tensor;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx,
+        ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * table, ggml_tensor * sinks, ggml_tensor * q_pos, ggml_tensor * k_pos,
+        float scale, int32_t extent, int32_t n_swa) {
+    if (!q || !k || !v || !table || !sinks || !q_pos || !k_pos ||
+            q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 24 || q->ne[3] != 1 || !ggml_is_contiguous(q) ||
+            (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) || v->type != k->type ||
+            k->ne[0] != 128 || k->ne[1] != 8 || k->ne[3] != 1 || (k->ne[2] % 64) != 0 || !ggml_are_same_shape(k, v) ||
+            !ggml_is_contiguous_1(k) || !ggml_is_contiguous_1(v) ||
+            table->type != GGML_TYPE_F32 || table->ne[0] != extent + 1 || table->ne[1] != 24 || table->ne[2] != q->ne[2] || table->ne[3] != 1 || !ggml_is_contiguous(table) ||
+            sinks->type != GGML_TYPE_F32 || sinks->ne[0] != 24 || sinks->ne[1] != q->ne[2] || ggml_nrows(sinks) != q->ne[2] || !ggml_is_contiguous(sinks) ||
+            q_pos->type != GGML_TYPE_I32 || q_pos->ne[0] != q->ne[2] || !ggml_is_contiguous(q_pos) ||
+            k_pos->type != GGML_TYPE_I32 || k_pos->ne[0] != k->ne[2] || !ggml_is_contiguous(k_pos)) {
+        return nullptr;
+    }
+    const size_t expected_nb1 = ggml_row_size(k->type, 128);
+    if (k->nb[1] != expected_nb1 || v->nb[1] != expected_nb1) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {q, k, v, table, sinks, q_pos, k_pos};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, q->ne[0]*q->ne[1], q->ne[2], 1, 1, args, 7,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused flash attention requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4] = n_swa;
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3] = extent;
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, scale);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_FLASH_ATTN;
+    ggml_set_name(node, "inkling_flash_attention");
     return node;
 }
 
@@ -1264,6 +1310,12 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_prefill_attention_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_prefill_attention_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_flash_attn_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_flash_attn_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_flash_attn_ready_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_flash_attn_ready_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_rel_mask_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_rel_mask_v1;

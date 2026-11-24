@@ -296,6 +296,90 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
         case GGML_OP_CUSTOM:
             {
                 const int32_t tag = node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+                if (tag == GGML_METAL_INKLING_FLASH_ATTN) {
+                    const uint32_t n_q    = (uint32_t)node->src[0]->ne[2];
+                    const uint32_t n_kv   = (uint32_t)node->src[1]->ne[2];
+                    const uint32_t n_swa  = (uint32_t)node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4];
+                    const uint32_t extent = (uint32_t)node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
+                    const float    scale  = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
+                    const ggml_type kv_type = node->src[1]->type;
+
+                    if (n_q >= 16) {
+                        const char * kernel = kv_type == GGML_TYPE_F16  ? "kernel_inkling_fa_tensor_f16"
+                                            : kv_type == GGML_TYPE_Q8_0 ? "kernel_inkling_fa_tensor_q8_0"
+                                                                        : "kernel_inkling_fa_tensor_q4_0";
+                        auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
+                        if (!pipeline.pipeline) {
+                            pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
+                        }
+                        struct {
+                            uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22;
+                            float scale;
+                        } args = {
+                            n_q, n_kv, extent, n_swa,
+                            (uint32_t)node->src[1]->nb[1], (uint32_t)node->src[1]->nb[2],
+                            (uint32_t)node->src[2]->nb[1], (uint32_t)node->src[2]->nb[2],
+                            scale,
+                        };
+                        const uint32_t Q = kv_type == GGML_TYPE_F16 ? 32u : 16u;
+                        const size_t smem = kv_type == GGML_TYPE_F16 ? 21504u : 27648u;
+                        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                        ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                        for (int i = 0; i < 7; ++i) {
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[i]), 1 + i);
+                        }
+                        ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 8);
+                        ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, smem, 0);
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + Q - 1) / Q, 24, 1, 32, 4, 1);
+                    } else {
+                        const uint32_t bq  = n_q == 1 ? 1u : 4u;
+                        const uint32_t nwg = n_kv <= 512u ? 1u : (n_kv <= 4096u ? 4u : (n_kv <= 32768u ? 16u : 32u));
+                        const char * kernel = nullptr;
+                        if (kv_type == GGML_TYPE_F16)       { kernel = bq == 1 ? "kernel_inkling_fa_decode_f16_q1"  : "kernel_inkling_fa_decode_f16_q4"; }
+                        else if (kv_type == GGML_TYPE_Q8_0) { kernel = bq == 1 ? "kernel_inkling_fa_decode_q8_0_q1" : "kernel_inkling_fa_decode_q8_0_q4"; }
+                        else                                { kernel = bq == 1 ? "kernel_inkling_fa_decode_q4_0_q1" : "kernel_inkling_fa_decode_q4_0_q4"; }
+                        auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
+                        if (!pipeline.pipeline) {
+                            pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
+                        }
+                        struct {
+                            uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22, nwg;
+                            float scale;
+                        } args = {
+                            n_q, n_kv, extent, n_swa,
+                            (uint32_t)node->src[1]->nb[1], (uint32_t)node->src[1]->nb[2],
+                            (uint32_t)node->src[2]->nb[1], (uint32_t)node->src[2]->nb[2],
+                            nwg, scale,
+                        };
+                        ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(node);
+                        ggml_metal_buffer_id bid_tmp = bid_dst;
+                        bid_tmp.offs += GGML_PAD(ggml_nbytes(node), 64);
+                        ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                        ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                        for (int i = 0; i < 7; ++i) {
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[i]), 1 + i);
+                        }
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_dst, 8);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_tmp, 9);
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + bq - 1) / bq, 8, nwg, 32, 4, 1);
+
+                        if (nwg > 1u) {
+                            ggml_metal_op_concurrency_reset(ctx);
+                            const char * rkernel = "kernel_inkling_fa_decode_reduce";
+                            auto rpipe = ggml_metal_library_get_pipeline(ctx->lib, rkernel);
+                            if (!rpipe.pipeline) {
+                                rpipe = ggml_metal_library_compile_pipeline(ctx->lib, rkernel, rkernel, nullptr);
+                            }
+                            uint32_t rdims[2] = {n_q, nwg};
+                            ggml_metal_encoder_set_pipeline(ctx->enc, rpipe);
+                            ggml_metal_encoder_set_bytes(ctx->enc, rdims, sizeof(rdims), 0);
+                            ggml_metal_encoder_set_buffer(ctx->enc, bid_tmp, 1);
+                            ggml_metal_encoder_set_buffer(ctx->enc, bid_dst, 2);
+                            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, n_q, 24, 1, 32, 1, 1);
+                        }
+                    }
+                    break;
+                }
                 if (tag == GGML_METAL_INKLING_PREFILL_ATTN) {
                     const char * kernel = "kernel_inkling_prefill_attention";
                     auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
@@ -321,12 +405,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    uint32_t n_elems = (uint32_t)ggml_nelements(node);
                     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                     for (int i = 0; i < 4; ++i) {
                         ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[i]), i);
                     }
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 4);
-                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, ggml_nelements(node) / 128, 1, 1, 128, 1, 1);
+                    ggml_metal_encoder_set_bytes(ctx->enc, &n_elems, sizeof(n_elems), 5);
+                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_elems + 127u) / 128u, 1, 1, 128, 1, 1);
                     break;
                 }
                 if (tag == GGML_METAL_INKLING_SITU) {
@@ -346,7 +432,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 3);
                     const int threads = 128;
                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (width + threads - 1) / threads,
-                            node->ne[1], 1, threads, 1, 1);
+                            ggml_nrows(node), 1, threads, 1, 1);
                     break;
                 }
                 if (tag == GGML_METAL_INKLING_CLIP) {

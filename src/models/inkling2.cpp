@@ -1,6 +1,8 @@
 #include "models.h"
 #include "../llama-expert-executor.h"
 #include "../llama-memory-hybrid-iswa.h"
+#include <cstdlib>
+#include <cstring>
 
 void llama_model_inkling2::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
@@ -270,7 +272,47 @@ ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tenso
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_inputs() {
-    inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa);
+    ggml_backend_t flash_backend = nullptr;
+    decltype(inp->flash_attention.create) flash_create = nullptr;
+    {
+        const char * env = std::getenv("LLAMA_INKLING_FUSED_ATTN");
+        const bool enabled = !env || std::strcmp(env, "0") != 0;
+        const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
+        const auto * attn_ctx = mctx_cur ? mctx_cur->get_attn() : nullptr;
+        const auto device = model.dev_output();
+        if (enabled && !expert_executor && ubatch.n_seqs == 1 && cparams.causal_attn && cparams.flash_attn &&
+                attn_ctx && device && std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0 &&
+                model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all &&
+                hparams.n_head(0) == 24 && hparams.n_head_kv(0) == 8 &&
+                hparams.n_embd_head_k(0) == 128 && hparams.n_embd_head_v(0) == 128 &&
+                attn_ctx->get_base()->get_type_k() == attn_ctx->get_base()->get_type_v() &&
+                attn_ctx->get_swa()->get_type_k()  == attn_ctx->get_swa()->get_type_v() &&
+                attn_ctx->get_base()->get_n_kv() % 64 == 0 &&
+                attn_ctx->get_swa()->get_n_kv()  % 64 == 0) {
+            const auto reg = ggml_backend_dev_backend_reg(device);
+            const auto ready = reinterpret_cast<bool (*)(ggml_backend_t, int64_t, ggml_type)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_flash_attn_ready_v1"));
+            const auto create = reinterpret_cast<decltype(flash_create)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_flash_attn_v1"));
+            if (ready && create) {
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                    auto backend = ggml_backend_sched_get_backend(sched, i);
+                    if (ggml_backend_get_device(backend) != device) { continue; }
+                    if (ready(backend, n_tokens, attn_ctx->get_base()->get_type_k()) &&
+                            ready(backend, n_tokens, attn_ctx->get_swa()->get_type_k())) {
+                        flash_backend = backend;
+                        flash_create  = create;
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    inp  = build_inp_mem_hybrid_iswa_rel(hparams.n_relative_extent, hparams.n_swa, flash_create != nullptr);
+    if (flash_create) {
+        inp->flash_attention = { flash_backend, flash_create };
+    }
     attn = inp->get_attn();
     recr = inp->get_recr();
 
@@ -368,39 +410,45 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
         cb(Vcur, "Vcur", il);
         cb(Rcur, "Rcur", il);
 
-        ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
-
-        const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
-        const int64_t n_kv     = rel_pos->ne[0];
-
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
         // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
         ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
 
-        ggml_tensor * kq_b = nullptr;
-        if (inkling_dense_backend && rel_mask_kernel) {
-            const auto & mask = is_swa ? attn->self_attn_mask_swa : attn->self_attn_mask;
-            if (!mask.rows) { kq_b = rel_mask_kernel(ctx0, table, sinks, rel_pos, mask.raw); }
-        }
-        const bool prebuilt_mask = kq_b != nullptr;
-        if (prebuilt_mask) {
-            ggml_backend_sched_set_tensor_backend(sched, kq_b, inkling_dense_backend);
+        if (inp->flash_attention.create && inp->self_k_pos) {
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il, false);
         } else {
-            // Shift the logits by the per-query sink logit, using a zero sink.
-            table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
-            table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
-            kq_b = ggml_get_rows(ctx0, table, rel_pos);
-            kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
-            kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
-            cb(kq_b, "kq_b", il);
+            ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
+
+            const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
+            const int64_t n_kv     = rel_pos->ne[0];
+
+            ggml_tensor * kq_b = nullptr;
+            if (inkling_dense_backend && rel_mask_kernel) {
+                const auto & mask = is_swa ? attn->self_attn_mask_swa : attn->self_attn_mask;
+                if (!mask.rows) { kq_b = rel_mask_kernel(ctx0, table, sinks, rel_pos, mask.raw); }
+            }
+            const bool prebuilt_mask = kq_b != nullptr;
+            if (prebuilt_mask) {
+                ggml_backend_sched_set_tensor_backend(sched, kq_b, inkling_dense_backend);
+            } else {
+                // Shift the logits by the per-query sink logit, using a zero sink.
+                table = ggml_sub(ctx0, table, ggml_reshape_3d(ctx0, sinks, 1, n_head, n_tokens));
+                table = ggml_cont(ctx0, ggml_permute(ctx0, table, 1, 0, 2, 3));
+                kq_b = ggml_get_rows(ctx0, table, rel_pos);
+                kq_b = ggml_reshape_4d(ctx0, kq_b, n_head, n_kv, n_tokens/n_stream, n_stream);
+                kq_b = ggml_cont(ctx0, ggml_permute(ctx0, kq_b, 2, 0, 1, 3));
+                cb(kq_b, "kq_b", il);
+            }
+
+            sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
+
+            cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, prebuilt_mask);
         }
-
-        sinks = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_head), 0.0f);
-
-        cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, prebuilt_mask);
 
         cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
