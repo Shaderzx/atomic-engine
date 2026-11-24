@@ -754,7 +754,6 @@ kernel void kernel_inkling_fa_decode_impl(
     const uint iwg = tgpig.z;
     const uint nwg = args.nwg;
     const uint extent = args.extent;
-    const uint extent_p1 = extent + 1u;
     const int  n_swa = (int)args.n_swa;
 
     half4  q_reg[SLOTS];
@@ -782,7 +781,7 @@ kernel void kernel_inkling_fa_decode_impl(
                 q_reg[slot] = half4(qv * args.scale);
                 const float sk = sinks[qh];
                 sink_r[slot] = sk;
-                far_r[slot] = table[(uint64_t)qh * extent_p1 + extent] - sk;
+                far_r[slot] = -sk;
                 o_reg[slot] = 0.0f;
                 M[slot] = -FLT_MAX / 2.0f;
                 S[slot] = 0.0f;
@@ -824,7 +823,7 @@ kernel void kernel_inkling_fa_decode_impl(
                     bias = far_r[slot];
                 } else {
                     const uint qh = q_idx * 24u + kv_head * 3u + (uint)g;
-                    bias = table[(uint64_t)qh * extent_p1 + (uint)d] - sink_r[slot];
+                    bias = table[(uint64_t)qh * extent + (uint)d] - sink_r[slot];
                 }
                 const float s = qk + bias;
                 const float m_new = max(M[slot], s);
@@ -856,7 +855,12 @@ kernel void kernel_inkling_fa_decode_impl(
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
             if (sg == 0) {
-                float m_all = max(max(sh_m[0], sh_m[1]), max(sh_m[2], sh_m[3]));
+                float m_all = -FLT_MAX / 2.0f;
+                FOR_UNROLL (int ksg = 0; ksg < NSG; ++ksg) {
+                    if (sh_s[ksg] > 0.0f) {
+                        m_all = max(m_all, sh_m[ksg]);
+                    }
+                }
                 float s_all = 0.0f;
                 float4 o_all = 0.0f;
                 FOR_UNROLL (int ksg = 0; ksg < NSG; ++ksg) {

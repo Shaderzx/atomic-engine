@@ -126,7 +126,14 @@ void llama_model_dflash::load_tensors_inkling2() {
 using inkling_mark_add = void (*)(ggml_tensor *);
 using inkling_dspark_argmax_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 
-static void ensure_inkling_fast_head(
+struct inkling_fast_head_ptrs {
+    ggml_tensor * output_short  = nullptr;
+    ggml_tensor * w2_fast       = nullptr;
+    ggml_tensor * w2_b_fast     = nullptr;
+    ggml_tensor * shortlist_ids = nullptr;
+};
+
+static inkling_fast_head_ptrs ensure_inkling_fast_head(
         const llama_model_dflash & dmodel,
         const llama_model & target,
         int64_t want_vocab,
@@ -143,8 +150,12 @@ static void ensure_inkling_fast_head(
         want_vocab = std::min<int64_t>(1024, n_vocab_full);
     }
 
+    auto snapshot = [&]() -> inkling_fast_head_ptrs {
+        return { head.output_short, head.w2_fast, head.w2_b_fast, head.shortlist_ids };
+    };
+
     if (head.target == &target && head.n_vocab == want_vocab && head.w2_q8 == want_q8) {
-        return;
+        return snapshot();
     }
 
     head.output_short  = nullptr;
@@ -159,11 +170,11 @@ static void ensure_inkling_fast_head(
 
     const bool use_short = want_vocab < n_vocab_full;
     if (!use_short && !want_q8) {
-        return;
+        return snapshot();
     }
     if (!dmodel.dev_output() || !dmodel.dspark_markov_w2 || !dmodel.dspark_markov_w2_b ||
             dmodel.dspark_markov_w2->type != GGML_TYPE_BF16 || !target.output) {
-        return;
+        return snapshot();
     }
 
     const int64_t t0 = ggml_time_us();
@@ -209,7 +220,7 @@ static void ensure_inkling_fast_head(
         /* .no_alloc   = */ true,
     };
     head.ctx.reset(ggml_init(init_p));
-    if (!head.ctx) { return; }
+    if (!head.ctx) { return snapshot(); }
 
     const ggml_type w2_type = want_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16;
     head.w2_fast = ggml_new_tensor_2d(head.ctx.get(), w2_type, rank, want_vocab);
@@ -229,7 +240,7 @@ static void ensure_inkling_fast_head(
     if (!head.buf) {
         head.output_short = head.w2_fast = head.w2_b_fast = head.shortlist_ids = nullptr;
         head.ctx.reset();
-        return;
+        return snapshot();
     }
 
     // Gather/quantize markov_w2
@@ -280,6 +291,7 @@ static void ensure_inkling_fast_head(
             ggml_type_name(w2_type),
             ggml_backend_buffer_get_size(head.buf.get()) / (1024.0 * 1024.0),
             (ggml_time_us() - t0) / 1000.0);
+    return snapshot();
 }
 
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
@@ -479,12 +491,12 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                 const bool want_q8 = !q8_env || std::strcmp(q8_env, "0") != 0;
 
                 const auto & dmodel = static_cast<const llama_model_dflash &>(model);
-                ensure_inkling_fast_head(dmodel, *target, want_vocab, want_q8);
+                const auto fh = ensure_inkling_fast_head(dmodel, *target, want_vocab, want_q8);
 
-                ggml_tensor * output_w      = dmodel.inkling_head.output_short  ? dmodel.inkling_head.output_short  : target->output;
-                ggml_tensor * w2_w          = dmodel.inkling_head.w2_fast       ? dmodel.inkling_head.w2_fast       : model.dspark_markov_w2;
-                ggml_tensor * w2_b_w        = dmodel.inkling_head.w2_b_fast     ? dmodel.inkling_head.w2_b_fast     : model.dspark_markov_w2_b;
-                ggml_tensor * shortlist_ids = dmodel.inkling_head.shortlist_ids;
+                ggml_tensor * output_w      = fh.output_short  ? fh.output_short  : target->output;
+                ggml_tensor * w2_w          = fh.w2_fast       ? fh.w2_fast       : model.dspark_markov_w2;
+                ggml_tensor * w2_b_w        = fh.w2_b_fast     ? fh.w2_b_fast     : model.dspark_markov_w2_b;
+                ggml_tensor * shortlist_ids = fh.shortlist_ids;
                 const int64_t v_eff         = w2_w->ne[1];
                 const int64_t n_draft       = head_rows - 1;
 

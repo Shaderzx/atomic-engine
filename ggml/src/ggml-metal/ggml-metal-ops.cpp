@@ -498,6 +498,39 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, 1, 1, 1, 256, 1, 1);
                     break;
                 }
+                if (tag == GGML_METAL_INKLING_MUL_SIGMOID) {
+                    const char * kernel = "kernel_inkling_mul_sigmoid";
+                    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
+                    if (!pipeline.pipeline) {
+                        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
+                    }
+                    uint32_t n4 = (uint32_t)(ggml_nelements(node) / 4);
+                    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[0]), 0);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[1]), 1);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 2);
+                    ggml_metal_encoder_set_bytes(ctx->enc, &n4, sizeof(n4), 3);
+                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n4 + 127u) / 128u, 1, 1, 128, 1, 1);
+                    break;
+                }
+                if (tag == GGML_METAL_INKLING_SOFTCAP_TRIM) {
+                    const char * kernel = "kernel_inkling_softcap_trim";
+                    auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
+                    if (!pipeline.pipeline) {
+                        pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
+                    }
+                    const float cap = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
+                    struct { uint32_t n_in, n_out, n_rows; float cap, inv_cap; } args = {
+                        uint32_t(node->src[0]->ne[0]), uint32_t(node->ne[0]), uint32_t(node->ne[1]),
+                        cap, 1.0f / cap
+                    };
+                    ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
+                    ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[0]), 1);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 2);
+                    ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.n_out + 255u) / 256u, args.n_rows, 1, 256, 1, 1);
+                    break;
+                }
                 if (tag == GGML_METAL_INKLING_CONTROL) {
                     const char * kernel = "kernel_inkling_control";
                     auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);

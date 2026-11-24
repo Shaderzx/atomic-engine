@@ -1205,6 +1205,36 @@ static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v1(ggml_context * 
     return node;
 }
 
+static ggml_tensor * ggml_backend_metal_inkling_mul_sigmoid_v1(ggml_context * ctx,
+        ggml_tensor * x, ggml_tensor * gate) {
+    if (!x || !gate || x->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(gate) || !ggml_are_same_shape(x, gate) ||
+            ggml_nelements(x) <= 0 || ggml_nelements(x) % 4 != 0 ||
+            ggml_nelements(x) / 4 > (int64_t) UINT32_MAX) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {x, gate};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, x->ne[0], x->ne[1], x->ne[2], x->ne[3], args, 2,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling mul_sigmoid requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_MUL_SIGMOID;
+    return node;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_softcap_trim_v1(ggml_context * ctx,
+        ggml_tensor * logits, int64_t n_out, float cap) {
+    if (!logits || logits->type != GGML_TYPE_F32 || !ggml_is_contiguous(logits) ||
+            logits->ne[2] != 1 || logits->ne[3] != 1 || logits->ne[1] <= 0 ||
+            n_out <= 0 || n_out > logits->ne[0] || !std::isfinite(cap) || cap <= 0.0f) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {logits};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, n_out, logits->ne[1], 1, 1, args, 1,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling softcap_trim requires Metal"); }, 1, nullptr);
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, cap);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_SOFTCAP_TRIM;
+    return node;
+}
+
 static ggml_tensor * ggml_backend_metal_inkling_situ_v1(ggml_context * ctx, ggml_tensor * gate_up,
         float beta, float linear_beta) {
     if (gate_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_up) ||
@@ -1303,11 +1333,12 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx
         ggml_tensor * table, ggml_tensor * sinks, ggml_tensor * q_pos, ggml_tensor * k_pos,
         float scale, int32_t extent, int32_t n_swa) {
     if (!q || !k || !v || !table || !sinks || !q_pos || !k_pos ||
+            extent <= 0 || n_swa < 0 || q->ne[2] <= 0 || k->ne[2] <= 0 ||
             q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 24 || q->ne[3] != 1 || !ggml_is_contiguous(q) ||
             (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) || v->type != k->type ||
             k->ne[0] != 128 || k->ne[1] != 8 || k->ne[3] != 1 || (k->ne[2] % 64) != 0 || !ggml_are_same_shape(k, v) ||
             !ggml_is_contiguous_1(k) || !ggml_is_contiguous_1(v) ||
-            table->type != GGML_TYPE_F32 || table->ne[0] != extent + 1 || table->ne[1] != 24 || table->ne[2] != q->ne[2] || table->ne[3] != 1 || !ggml_is_contiguous(table) ||
+            table->type != GGML_TYPE_F32 || table->ne[0] != extent || table->ne[1] != 24 || table->ne[2] != q->ne[2] || table->ne[3] != 1 || !ggml_is_contiguous(table) ||
             sinks->type != GGML_TYPE_F32 || sinks->ne[0] != 24 || sinks->ne[1] != q->ne[2] || ggml_nrows(sinks) != q->ne[2] || !ggml_is_contiguous(sinks) ||
             q_pos->type != GGML_TYPE_I32 || q_pos->ne[0] != q->ne[2] || !ggml_is_contiguous(q_pos) ||
             k_pos->type != GGML_TYPE_I32 || k_pos->ne[0] != k->ne[2] || !ggml_is_contiguous(k_pos)) {
@@ -1443,6 +1474,12 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_dspark_argmax_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_mul_sigmoid_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_mul_sigmoid_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_softcap_trim_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_softcap_trim_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_situ_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_situ_v1;

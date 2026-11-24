@@ -24,6 +24,8 @@ enum { GGML_METAL_INKLING_MIX = 0x4154453B };
 enum { GGML_METAL_INKLING_CTRL_DOWN = 0x4154453C };
 enum { GGML_METAL_INKLING_CTRL_APPLY = 0x4154453D };
 enum { GGML_METAL_INKLING_DSPARK_ARGMAX = 0x4154453E };
+enum { GGML_METAL_INKLING_MUL_SIGMOID = 0x4154453F };
+enum { GGML_METAL_INKLING_SOFTCAP_TRIM = 0x41544540 };
 static inline bool ggml_metal_is_host_expert(const struct ggml_tensor * node) {
     return node->op == GGML_OP_CUSTOM &&
         node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_HOST_EXPERT_BRIDGE;

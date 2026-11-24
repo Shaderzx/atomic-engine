@@ -447,6 +447,41 @@ kernel void kernel_inkling_dspark_argmax_s2(
     }
 }
 
+// Fused Inkling attention output gate: dst[i] = x[i] * sigmoid(gate[i]).
+kernel void kernel_inkling_mul_sigmoid(
+        device const float4 * x    [[buffer(0)]],
+        device const float4 * gate [[buffer(1)]],
+        device       float4 * dst  [[buffer(2)]],
+        constant uint & n4         [[buffer(3)]],
+        uint i [[thread_position_in_grid]]) {
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    if (i >= n4) { return; }
+    const float4 sig = 1.0f / (1.0f + exp(-gate[i]));
+    dst[i] = x[i] * sig;
+}
+
+// Fused Inkling final logit softcap + unpadded vocabulary trim in a single pass.
+struct inkling_softcap_trim_args {
+    uint  n_in;
+    uint  n_out;
+    uint  n_rows;
+    float cap;
+    float inv_cap;
+};
+
+kernel void kernel_inkling_softcap_trim(
+        constant inkling_softcap_trim_args & args [[buffer(0)]],
+        device const float * src                  [[buffer(1)]],
+        device       float * dst                  [[buffer(2)]],
+        uint2 p [[thread_position_in_grid]]) {
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    if (p.x >= args.n_out || p.y >= args.n_rows) { return; }
+    const float v = src[ulong(p.y) * args.n_in + p.x];
+    dst[ulong(p.y) * args.n_out + p.x] = args.cap * precise::tanh(v * args.inv_cap);
+}
+
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
 

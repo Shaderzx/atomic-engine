@@ -2564,6 +2564,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * (*mix_kernel)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *) = nullptr;
         ggml_tensor * (*ctrl_down_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*ctrl_apply_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
+        ggml_tensor * (*mul_sigmoid_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *) = nullptr;
+        ggml_tensor * (*softcap_trim_kernel)(ggml_context *, ggml_tensor *, int64_t, float) = nullptr;
         ggml_tensor * (*clip_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, float) = nullptr;
         ggml_tensor * (*rel_mask_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*conv_residual_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float) = nullptr;

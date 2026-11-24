@@ -382,7 +382,6 @@ kernel void kernel_inkling_fa_tensor_impl(
     const uint kv_head = head / 3u;
     const ushort tiitg = sgitg * NW + tiisg;
     const uint extent    = args.extent;
-    const uint extent_p1 = extent + 1u;
     const int  n_swa     = (int)args.n_swa;
 
     threadgroup half  * sq      = (threadgroup half  *) shmem;             // [Q, 128]
@@ -422,7 +421,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             const uint qh = q_idx * 24u + head;
             const float sk_val = sinks[qh];
             sink_r[jj] = sk_val;
-            far_bias_r[jj] = table[(uint64_t)qh * extent_p1 + extent] - sk_val;
+            far_bias_r[jj] = -sk_val;
         } else {
             qpos_r[jj] = -1;
             sink_r[jj] = 0.0f;
@@ -435,9 +434,6 @@ kernel void kernel_inkling_fa_tensor_impl(
     if (tiisg == 0) {
         kpos_tg[sgitg]     = my_min_qp;
         kpos_tg[sgitg + 4] = my_max_qp;
-    }
-    if (tiitg == 0) {
-        sf[0] = 0;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -517,6 +513,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             inkling_fa_stage_kv_q4_0(skv, v, ic, kv_head, args.nb21, args.nb22, tiitg);
         }
 
+        int sg_upd = 0;
         FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
             const uint j = (uint)(jj * NSG + sgitg);
             const uint q_idx = iq1 + j;
@@ -533,7 +530,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             } else {
                 const int qp = qpos_r[jj];
                 const float sk_val = sink_r[jj];
-                const uint64_t tbl_off = (uint64_t)(q_idx * 24u + head) * extent_p1;
+                const uint64_t tbl_off = (uint64_t)(q_idx * 24u + head) * extent;
                 FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
                     const uint col = ii * NW + tiisg;
                     const int kp = kpos_tg[col];
@@ -541,8 +538,8 @@ kernel void kernel_inkling_fa_tensor_impl(
                     if (kp < 0 || d < 0 || (n_swa > 0 && d >= n_swa)) {
                         s[ii] = -INFINITY;
                     } else {
-                        const uint b = (uint)d < extent ? (uint)d : extent;
-                        s[ii] = ss[j * C + col] + (table[tbl_off + b] - sk_val);
+                        const float rel = (uint)d < extent ? table[tbl_off + (uint)d] : 0.0f;
+                        s[ii] = ss[j * C + col] + (rel - sk_val);
                     }
                 }
             }
@@ -557,9 +554,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             if (m > M[jj]) {
                 ms = exp(M[jj] - m);
                 M[jj] = m;
-                if (tiisg == 0) {
-                    sf[0] = (int)(ic0 + 1u);
-                }
+                sg_upd = 1;
             }
 
             float sum = 0.0f;
@@ -574,10 +569,13 @@ kernel void kernel_inkling_fa_tensor_impl(
                 sr[j] = ms;
             }
         }
+        if (tiisg == 0) {
+            sf[sgitg] = sg_upd;
+        }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (sf[0] == (int)(ic0 + 1u)) {
+        if ((sf[0] | sf[1] | sf[2] | sf[3]) != 0) {
             FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
                 if (co.is_valid_element(i)) {
                     co[i] *= sr[co.get_multidimensional_index(i)[1]];

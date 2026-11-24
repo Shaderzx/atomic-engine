@@ -1382,6 +1382,16 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     bool has_rnn_context = false;
     bool use_prompt_lookup = false;
 
+    static constexpr size_t  LOOKUP_BUCKETS   = 1u << 16; // 65536 * 16B = 1 MiB
+    struct lookup_bucket {
+        int32_t pos[4] = { 0, 0, 0, 0 };
+    };
+    mutable std::vector<lookup_bucket> lookup_table;
+    mutable size_t      lookup_indexed = 0;
+    mutable llama_token lookup_tok0    = LLAMA_TOKEN_NULL;
+    mutable llama_token lookup_tok_mid = LLAMA_TOKEN_NULL;
+    mutable llama_token lookup_tok_end = LLAMA_TOKEN_NULL;
+
     size_t context_rows = 0;
     std::vector<float>     context_embd;
     std::vector<llama_pos> context_pos;
@@ -1400,8 +1410,18 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
 
         has_rnn_context = llama_atomic_is_inkling_dspark(model_dft);
         if (has_rnn_context && n_seq == 1) {
-            const char * lookup = std::getenv("LLAMA_EXPERIMENTAL_INKLING_PROMPT_LOOKUP");
-            use_prompt_lookup = lookup && std::strcmp(lookup, "1") == 0;
+            const char * lookup = std::getenv("LLAMA_INKLING_PROMPT_LOOKUP");
+            const char * legacy = std::getenv("LLAMA_EXPERIMENTAL_INKLING_PROMPT_LOOKUP");
+            if (lookup) {
+                use_prompt_lookup = std::strcmp(lookup, "0") != 0;
+            } else if (legacy) {
+                use_prompt_lookup = std::strcmp(legacy, "0") != 0;
+            } else {
+                use_prompt_lookup = true;
+            }
+            if (use_prompt_lookup) {
+                lookup_table.resize(LOOKUP_BUCKETS);
+            }
         }
 
         if (this->params.p_min > 0.0f) {
@@ -1422,7 +1442,7 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             if (sample_from_anchor || causal_attn) {
                 throw std::runtime_error("Inkling2 DSpark requires a noncausal block with an anchor");
             }
-            context_rows = (size_t) block_size + 1;
+            context_rows = (size_t) block_size + 2;
             const size_t slots = (size_t) n_seq * context_rows;
             context_embd.resize(slots * (size_t) n_embd_dec);
             context_pos.assign(slots, -1);
@@ -1452,39 +1472,101 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     }
 
 protected:
-    // Copy a proposal from committed tokens. The target verifies it just like a DSpark block.
+    static inline uint32_t hash_4gram(llama_token a, llama_token b, llama_token c, llama_token d) {
+        uint64_t h = (uint64_t)(uint32_t) a * 0x9E3779B185EBCA87ULL;
+        h ^= (uint64_t)(uint32_t) b * 0xC2B2AE3D27D4EB4FULL;
+        h = (h ^ (h >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        h ^= (uint64_t)(uint32_t) c * 0x165667B19E3779F9ULL;
+        h = (h ^ (h >> 27)) * 0x94D049BB133111EBULL;
+        h ^= (uint64_t)(uint32_t) d * 0x2545F4914F6CDD1DULL;
+        return (uint32_t)((h ^ (h >> 31)) & (LOOKUP_BUCKETS - 1));
+    }
+
+    // O(1) incremental 4-gram hash-indexed suffix lookup across the entire 256K+ history.
+    // The target always verifies every proposed token losslessly, just like a DSpark block.
     bool draft_from_prompt(common_speculative_draft_params & dp) const {
-        constexpr size_t suffix = 32;
-        constexpr size_t window = 8192;
-        const int32_t count = dp.n_max < 0 ? params.n_max : std::min(dp.n_max, params.n_max);
-        if (!dp.prompt || dp.result_q || dp.temp > 0 || count < std::max(1, params.n_min)) {
+        if (!dp.prompt || dp.result_q || lookup_table.empty()) {
             return false;
         }
         const auto & history = *dp.prompt;
-        if (history.size() < suffix + count) {
+        const size_t L = history.size();
+        const size_t min_suffix = dp.temp <= 0.0f ? 8 : 12;
+        if (L < min_suffix + 1) {
             return false;
         }
-        const size_t lower = std::max(suffix - 1, history.size() > window ? history.size() - window : 0);
-        for (size_t end = history.size() - count; end > lower; --end) {
-            if (history[end - 1] == dp.id_last &&
-                    std::equal(history.end() - (suffix - 1), history.end(), history.begin() + end - suffix)) {
-                dp.result->assign(history.begin() + end, history.begin() + end + count);
-                LOG_DBG("%s: matched %zu tokens, proposing %d tokens\n", __func__, suffix, count);
-                return true;
+
+        // Sync incremental index with history; reset if prompt changed or rolled back.
+        if (L < lookup_indexed ||
+                (lookup_indexed > 0 && (history[0] != lookup_tok0 ||
+                                        history[lookup_indexed / 2] != lookup_tok_mid ||
+                                        history[lookup_indexed - 1] != lookup_tok_end))) {
+            std::memset(lookup_table.data(), 0, lookup_table.size() * sizeof(lookup_bucket));
+            lookup_indexed = 0;
+        }
+        for (size_t end = std::max<size_t>(4, lookup_indexed + 1); end <= L; ++end) {
+            const uint32_t h = hash_4gram(history[end - 4], history[end - 3], history[end - 2], history[end - 1]);
+            auto & b = lookup_table[h];
+            b.pos[3] = b.pos[2];
+            b.pos[2] = b.pos[1];
+            b.pos[1] = b.pos[0];
+            b.pos[0] = (int32_t) end;
+        }
+        lookup_indexed = L;
+        lookup_tok0    = history[0];
+        lookup_tok_mid = history[L / 2];
+        lookup_tok_end = history[L - 1];
+
+        const uint32_t h = hash_4gram(history[L - 3], history[L - 2], history[L - 1], dp.id_last);
+        const auto & b = lookup_table[h];
+
+        size_t best_matched = 0;
+        size_t best_end     = 0;
+        for (int s = 0; s < 4; ++s) {
+            const int32_t end_i = b.pos[s];
+            if (end_i < (int32_t) min_suffix) {
+                continue;
+            }
+            const size_t end = (size_t) end_i;
+            if (end >= L || history[end - 1] != dp.id_last) {
+                continue;
+            }
+            size_t matched = 1;
+            const size_t max_match = std::min<size_t>(32, std::min<size_t>(end, L + 1));
+            while (matched < max_match && history[end - 1 - matched] == history[L - matched]) {
+                ++matched;
+            }
+            if (matched >= min_suffix && matched > best_matched) {
+                best_matched = matched;
+                best_end     = end;
             }
         }
-        return false;
+        if (best_matched < min_suffix) {
+            return false;
+        }
+
+        // Respect params.n_max so we never exceed ctx_tgt's reserved n_outputs_max / backend sampling slots.
+        const int32_t max_count = dp.n_max < 0 ? params.n_max : std::min(dp.n_max, params.n_max);
+        const int32_t avail     = (int32_t) std::min<size_t>(L - best_end, (size_t) std::max(0, max_count));
+        const int32_t count     = avail;
+        if (count < std::max(1, params.n_min)) {
+            return false;
+        }
+        dp.result->assign(history.begin() + best_end, history.begin() + best_end + count);
+        LOG_DBG("%s: matched %zu tokens at pos %zu, proposing %d tokens\n", __func__, best_matched, best_end, count);
+        return true;
     }
 
     void store_context_features(llama_seq_id seq_id, int32_t n_chunk) override {
         if (!has_rnn_context) {
             return;
         }
-        // Keep the committed boundary when the target rejects part of a verification batch.
+        // Keep the committed boundary when the target rejects part of a verification batch
+        // (block_size + 2 rows covers the committed boundary plus the full verified batch).
         const float * projected = llama_get_embeddings_nextn(params.ctx_dft);
         if (projected) {
             const size_t seq_offset = (size_t) seq_id * context_rows;
-            const llama_pos pos_min = std::max(0, batch_inject.tokens.back().pos[0] - block_size);
+            const llama_pos keep_window = (llama_pos) (context_rows - 1);
+            const llama_pos pos_min = std::max<llama_pos>(0, batch_inject.tokens.back().pos[0] - keep_window);
             for (int32_t i = 0; i < n_chunk; ++i) {
                 const llama_pos pos = batch_inject.tokens[i].pos[0];
                 if (pos < pos_min) {

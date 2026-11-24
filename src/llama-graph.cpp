@@ -1479,7 +1479,8 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     }
 
     if (self_k_pos) {
-        res &= params.ubatch.n_seqs == 1 && params.cparams.causal_attn;
+        res &= !params.cparams.training && params.cparams.causal_attn &&
+               params.ubatch.n_seqs == 1 && params.ubatch.n_seqs_unq == 1;
         res &= self_q_pos->ne[0] == params.ubatch.n_tokens;
         res &= self_k_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
         res &= self_k_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
@@ -4003,11 +4004,8 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * cur = nullptr;
     if (flash && flash->create) {
         cur = flash->create(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos, kq_scale, flash_extent, flash_n_swa);
-        if (cur && ggml_backend_supports_op(flash->backend, cur)) {
-            ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
-        } else {
-            cur = nullptr;
-        }
+        GGML_ASSERT(cur && ggml_backend_supports_op(flash->backend, cur));
+        ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
     }
     if (!cur && prefill && prefill->create) {
         cur = prefill->create(ctx0, q, k, v, kq_mask, kq_scale);

@@ -301,15 +301,21 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
         const auto * mctx_cur = static_cast<const llama_memory_hybrid_iswa_context *>(mctx);
         const auto * attn_ctx = mctx_cur ? mctx_cur->get_attn() : nullptr;
         const auto device = model.dev_output();
-        if (enabled && !expert_executor && ubatch.n_seqs == 1 && cparams.causal_attn && cparams.flash_attn &&
+        bool head_dims_match = hparams.n_relative_extent > 0 && hparams.n_layer() > 0;
+        for (uint32_t il = 0; head_dims_match && il < hparams.n_layer(); ++il) {
+            head_dims_match &= hparams.n_head(il) == 24 && hparams.n_head_kv(il) == 8 &&
+                               hparams.n_embd_head_k(il) == 128 && hparams.n_embd_head_v(il) == 128;
+        }
+        if (enabled && !expert_executor && !cparams.training &&
+                (cparams.kv_unified || cparams.n_seq_max == 1) &&
+                ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 &&
+                cparams.causal_attn && cparams.flash_attn && head_dims_match &&
                 attn_ctx && device && std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0 &&
                 model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all &&
-                hparams.n_head(0) == 24 && hparams.n_head_kv(0) == 8 &&
-                hparams.n_embd_head_k(0) == 128 && hparams.n_embd_head_v(0) == 128 &&
                 attn_ctx->get_base()->get_type_k() == attn_ctx->get_base()->get_type_v() &&
                 attn_ctx->get_swa()->get_type_k()  == attn_ctx->get_swa()->get_type_v() &&
-                attn_ctx->get_base()->get_n_kv() % 64 == 0 &&
-                attn_ctx->get_swa()->get_n_kv()  % 64 == 0) {
+                attn_ctx->get_base()->get_n_kv() > 0 && attn_ctx->get_base()->get_n_kv() % 64 == 0 &&
+                attn_ctx->get_swa()->get_n_kv()  > 0 && attn_ctx->get_swa()->get_n_kv()  % 64 == 0) {
             const auto reg = ggml_backend_dev_backend_reg(device);
             const auto ready = reinterpret_cast<bool (*)(ggml_backend_t, int64_t, ggml_type)>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_flash_attn_ready_v1"));
@@ -447,14 +453,16 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
         ggml_tensor * sinks = build_lora_mm(layer.attn_sink_proj, inputs[0]);
 
-        // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
-        ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
-
         if (inp->flash_attention.create && inp->self_k_pos) {
+            // Fused Inkling FlashAttention handles distances >= extent as zero relative bias (-sink) directly,
+            // avoiding the per-layer ggml_pad on attn_rel_bias.
+            ggml_tensor * table = ggml_mul_mat(ctx0, layer.attn_rel_bias, Rcur);
             cur = build_attn(inp,
                     nullptr, nullptr, nullptr,
                     Qcur, Kcur, Vcur, table, sinks, 1.0f/sqrtf(n_embd_head), il, false);
         } else {
+            // project r on the bias table first, then gather by distance: only the gathered bias is n_kv x n_tokens x n_head
+            ggml_tensor * table = ggml_mul_mat(ctx0, ggml_pad(ctx0, layer.attn_rel_bias, 0, 1, 0, 0), Rcur);
             ggml_tensor * rel_pos = is_swa ? inp->self_rel_pos_swa : inp->self_rel_pos;
 
             const int64_t n_stream = (is_swa ? attn->self_attn_mask_swa.raw : attn->self_attn_mask.raw)->ne[3];
@@ -485,7 +493,17 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
                     Qcur, Kcur, Vcur, kq_b, sinks, 1.0f/sqrtf(n_embd_head), il, prebuilt_mask);
         }
 
-        cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, build_lora_mm(layer.wqkv_gate, inputs[0])));
+        ggml_tensor * attn_gate = build_lora_mm(layer.wqkv_gate, inputs[0]);
+        if (inkling_dense_backend && mul_sigmoid_kernel) {
+            if (auto * gated = mul_sigmoid_kernel(ctx0, cur, attn_gate)) {
+                ggml_backend_sched_set_tensor_backend(sched, gated, inkling_dense_backend);
+                cur = gated;
+            } else {
+                cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, attn_gate));
+            }
+        } else {
+            cur = ggml_mul(ctx0, cur, ggml_sigmoid(ctx0, attn_gate));
+        }
         cur = convolve(build_lora_mm(layer.wo, cur), layer.attn_post_conv, nullptr, state, history, recr, 2*n_embd_k_gqa);
         cb(cur, "attn_out", il);
     }
@@ -555,12 +573,22 @@ void llama_model_inkling2::graph::build_output(ggml_tensor * cur, const std::vec
 
     if (hparams.f_final_logit_softcapping != 0.0f) {
         const float cap = hparams.f_final_logit_softcapping;
-
-        cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+        if (inkling_dense_backend && softcap_trim_kernel) {
+            if (auto * fused = softcap_trim_kernel(ctx0, cur, hparams.n_vocab_unpadded, cap)) {
+                ggml_backend_sched_set_tensor_backend(sched, fused, inkling_dense_backend);
+                cur = fused;
+            } else {
+                cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+                cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+            }
+        } else {
+            cur = ggml_scale(ctx0, ggml_tanh(ctx0, ggml_scale(ctx0, cur, 1.0f/cap)), cap);
+            cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
+        }
+    } else {
+        // drop the padded vocabulary
+        cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
     }
-
-    // drop the padded vocabulary
-    cur = ggml_cont(ctx0, ggml_view_2d(ctx0, cur, hparams.n_vocab_unpadded, cur->ne[1], cur->nb[1], 0));
 
     cb(cur, "result_output", -1);
     res->t_logits = cur;

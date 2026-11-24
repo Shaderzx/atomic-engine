@@ -116,6 +116,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 ctrl_apply_kernel = reinterpret_cast<decltype(ctrl_apply_kernel)>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_ctrl_apply_v1"));
             }
+            if (resident_fused) {
+                mul_sigmoid_kernel = reinterpret_cast<decltype(mul_sigmoid_kernel)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_mul_sigmoid_v1"));
+                softcap_trim_kernel = reinterpret_cast<decltype(softcap_trim_kernel)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_softcap_trim_v1"));
+            }
             if (use_rel) {
                 rel_mask_kernel = reinterpret_cast<decltype(rel_mask_kernel)>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_rel_mask_v1"));
