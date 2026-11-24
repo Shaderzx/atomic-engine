@@ -1619,7 +1619,7 @@ struct llama_model_dflash : public llama_model_base {
         int64_t target_ne1  = 0;
         int64_t req_vocab   = 0;
         int64_t eff_vocab   = 0;
-        bool    w2_q8       = false;
+        ggml_type w2_type   = GGML_TYPE_BF16;
         ggml_context_ptr        ctx;
         ggml_backend_buffer_ptr buf;
         ggml_tensor * output_short  = nullptr;

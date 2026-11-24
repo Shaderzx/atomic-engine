@@ -51,7 +51,7 @@ bool ggml_metal_op_mul_mat_id_use_mm(const struct ggml_tensor * op, bool has_sim
         return env ? std::atoll(env) : 0;
     }();
     const int64_t mm_min = mm_min_env > 0 ? mm_min_env
-                         : (op->src[0]->type == GGML_TYPE_Q4_0 ? 12 : 8);
+                         : (op->src[0]->type == GGML_TYPE_IQ2_XXS ? 6 : 8);
 
     return has_simdgroup_mm && ne00 >= 64 && ne02 <= 1024 && ne21 >= mm_min;
 }

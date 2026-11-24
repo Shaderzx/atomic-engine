@@ -184,6 +184,12 @@ struct inkling_block_q8_0 {
 };
 static_assert(sizeof(inkling_block_q8_0) == 34, "inkling_block_q8_0 must match GGML block_q8_0");
 
+struct inkling_block_q4_0 {
+    half    d;
+    uint8_t qs[16];
+};
+static_assert(sizeof(inkling_block_q4_0) == 18, "inkling_block_q4_0 must match GGML block_q4_0");
+
 struct inkling_ctrl_args {
     uint  n_embd;
     uint  rank;
@@ -322,11 +328,13 @@ kernel void kernel_inkling_ctrl_apply_q8_0(
     dst[idx] = (x - forgotten) + gained;
 }
 
-// Fused single-pass Inkling DSpark Markov head + strict first-maximum argmax.
+// Fused single-pass Inkling DSpark Markov head + strict first-maximum argmax + top1-top2 margin.
 // Replaces w2*latent + w2_b + base + softcap + 6-pass tie-break + CPU logit readback.
 struct inkling_dspark_part {
     float val;
     uint  idx;
+    float val2;
+    uint  pad;
 };
 
 struct inkling_dspark_argmax_args {
@@ -347,6 +355,93 @@ inline bool inkling_dspark_better(float val_a, uint idx_a, float val_b, uint idx
     if (idx_a == 0xFFFFFFFFu) { return false; }
     if (idx_b == 0xFFFFFFFFu) { return true; }
     return (val_a > val_b) || (val_a == val_b && idx_a < idx_b);
+}
+
+inline void inkling_dspark_update(thread float & best_val, thread uint & best_idx, thread float & second_val, float s, uint v) {
+    if (inkling_dspark_better(s, v, best_val, best_idx)) {
+        if (best_idx != 0xFFFFFFFFu) {
+            second_val = max(second_val, best_val);
+        }
+        best_val = s;
+        best_idx = v;
+    } else if (v != 0xFFFFFFFFu && s > second_val) {
+        second_val = s;
+    }
+}
+
+inline inkling_dspark_part inkling_dspark_merge(inkling_dspark_part a, inkling_dspark_part b) {
+    if (b.idx == 0xFFFFFFFFu) { return a; }
+    if (a.idx == 0xFFFFFFFFu) { return b; }
+    if (inkling_dspark_better(b.val, b.idx, a.val, a.idx)) {
+        return { b.val, b.idx, max(b.val2, a.val), 0u };
+    }
+    return { a.val, a.idx, max(a.val2, b.val), 0u };
+}
+
+kernel void kernel_inkling_dspark_argmax_s1_q4_0(
+        constant inkling_dspark_argmax_args & args [[buffer(0)]],
+        device const inkling_block_q4_0 * w2       [[buffer(1)]],
+        device const float * w2_b                  [[buffer(2)]],
+        device const float * base_row              [[buffer(3)]],
+        device const float * latent                [[buffer(4)]],
+        device inkling_dspark_part * parts         [[buffer(5)]],
+        uint   group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh_lat[512];
+    for (uint k = tid; k < args.rank; k += 256u) {
+        sh_lat[k] = latent[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint nb = args.rank / 32u;
+    const uint g_blk = lane / 4u;
+    const uint p = (lane % 4u) * 4u;
+
+    float best_val   = -INFINITY;
+    uint  best_idx   = 0xFFFFFFFFu;
+    float second_val = -INFINITY;
+
+    for (uint v = group * 8u + sg; v < args.vocab; v += 2048u) {
+        device const inkling_block_q4_0 * w_row = w2 + ulong(v) * nb;
+        float acc = 0.0f;
+        for (uint ib = g_blk; ib < nb; ib += 8u) {
+            const device inkling_block_q4_0 & b = w_row[ib];
+            const uchar4 q = uchar4(b.qs[p + 0], b.qs[p + 1], b.qs[p + 2], b.qs[p + 3]);
+            const float4 ql = float4(int4(q & 0x0Fu) - 8);
+            const float4 qh = float4(int4(q >> 4u) - 8);
+            const uint k0 = ib * 32u + p;
+            const float4 l0 = float4(sh_lat[k0 +  0], sh_lat[k0 +  1], sh_lat[k0 +  2], sh_lat[k0 +  3]);
+            const float4 l1 = float4(sh_lat[k0 + 16], sh_lat[k0 + 17], sh_lat[k0 + 18], sh_lat[k0 + 19]);
+            acc = fma(float(b.d), dot(ql, l0) + dot(qh, l1), acc);
+        }
+        const float d = simd_sum(acc);
+        if (lane == 0) {
+            float s = d + w2_b[v] + base_row[v];
+            if (!inkling_dspark_isnan(s)) {
+                if (args.cap > 0.0f) {
+                    s = args.cap * precise::tanh(s * args.inv_cap);
+                }
+                if (!inkling_dspark_isnan(s)) {
+                    inkling_dspark_update(best_val, best_idx, second_val, s, v);
+                }
+            }
+        }
+    }
+
+    threadgroup inkling_dspark_part sh_sg[8];
+    if (lane == 0) {
+        sh_sg[sg] = { best_val, best_idx, second_val, 0u };
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        inkling_dspark_part win = sh_sg[0];
+        for (uint j = 1u; j < 8u; ++j) {
+            win = inkling_dspark_merge(win, sh_sg[j]);
+        }
+        parts[group] = win;
+    }
 }
 
 kernel void kernel_inkling_dspark_argmax_s1_q8_0(
@@ -370,8 +465,9 @@ kernel void kernel_inkling_dspark_argmax_s1_q8_0(
     const uint g_blk = lane / 4u;
     const uint p = (lane % 4u) * 8u;
 
-    float best_val = -INFINITY;
-    uint  best_idx = 0xFFFFFFFFu;
+    float best_val   = -INFINITY;
+    uint  best_idx   = 0xFFFFFFFFu;
+    float second_val = -INFINITY;
 
     for (uint v = group * 8u + sg; v < args.vocab; v += 2048u) {
         device const inkling_block_q8_0 * w_row = w2 + ulong(v) * nb;
@@ -392,9 +488,8 @@ kernel void kernel_inkling_dspark_argmax_s1_q8_0(
                 if (args.cap > 0.0f) {
                     s = args.cap * precise::tanh(s * args.inv_cap);
                 }
-                if (!inkling_dspark_isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
-                    best_val = s;
-                    best_idx = v;
+                if (!inkling_dspark_isnan(s)) {
+                    inkling_dspark_update(best_val, best_idx, second_val, s, v);
                 }
             }
         }
@@ -402,15 +497,13 @@ kernel void kernel_inkling_dspark_argmax_s1_q8_0(
 
     threadgroup inkling_dspark_part sh_sg[8];
     if (lane == 0) {
-        sh_sg[sg] = { best_val, best_idx };
+        sh_sg[sg] = { best_val, best_idx, second_val, 0u };
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         inkling_dspark_part win = sh_sg[0];
         for (uint j = 1u; j < 8u; ++j) {
-            if (inkling_dspark_better(sh_sg[j].val, sh_sg[j].idx, win.val, win.idx)) {
-                win = sh_sg[j];
-            }
+            win = inkling_dspark_merge(win, sh_sg[j]);
         }
         parts[group] = win;
     }
@@ -435,8 +528,9 @@ kernel void kernel_inkling_dspark_argmax_s1_bf16(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const uint r4 = args.rank / 4u;
-    float best_val = -INFINITY;
-    uint  best_idx = 0xFFFFFFFFu;
+    float best_val   = -INFINITY;
+    uint  best_idx   = 0xFFFFFFFFu;
+    float second_val = -INFINITY;
 
     for (uint v = group * 8u + sg; v < args.vocab; v += 2048u) {
         device const bfloat4 * w_row = w2 + ulong(v) * r4;
@@ -454,9 +548,8 @@ kernel void kernel_inkling_dspark_argmax_s1_bf16(
                 if (args.cap > 0.0f) {
                     s = args.cap * precise::tanh(s * args.inv_cap);
                 }
-                if (!inkling_dspark_isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
-                    best_val = s;
-                    best_idx = v;
+                if (!inkling_dspark_isnan(s)) {
+                    inkling_dspark_update(best_val, best_idx, second_val, s, v);
                 }
             }
         }
@@ -464,15 +557,13 @@ kernel void kernel_inkling_dspark_argmax_s1_bf16(
 
     threadgroup inkling_dspark_part sh_sg[8];
     if (lane == 0) {
-        sh_sg[sg] = { best_val, best_idx };
+        sh_sg[sg] = { best_val, best_idx, second_val, 0u };
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     if (tid == 0) {
         inkling_dspark_part win = sh_sg[0];
         for (uint j = 1u; j < 8u; ++j) {
-            if (inkling_dspark_better(sh_sg[j].val, sh_sg[j].idx, win.val, win.idx)) {
-                win = sh_sg[j];
-            }
+            win = inkling_dspark_merge(win, sh_sg[j]);
         }
         parts[group] = win;
     }
@@ -491,9 +582,7 @@ kernel void kernel_inkling_dspark_argmax_s2(
 
     for (uint stride = 128u; stride > 0u; stride >>= 1u) {
         if (tid < stride) {
-            if (inkling_dspark_better(sh[tid + stride].val, sh[tid + stride].idx, sh[tid].val, sh[tid].idx)) {
-                sh[tid] = sh[tid + stride];
-            }
+            sh[tid] = inkling_dspark_merge(sh[tid], sh[tid + stride]);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -501,13 +590,16 @@ kernel void kernel_inkling_dspark_argmax_s2(
     if (tid == 0) {
         if (sh[0].idx < args.vocab) {
             const int tok = args.has_shortlist ? shortlist_ids[sh[0].idx] : int(sh[0].idx);
+            const float margin = sh[0].val2 > -INFINITY ? max(0.0f, sh[0].val - sh[0].val2) : 30.0f;
             dst[0] = tok;
             dst[1] = max(tok, 0);
+            dst[2] = as_type<int>(margin);
         } else {
             // No finite candidate (e.g. all-NaN logits): dst[0] = -1 tells the host to stop drafting,
             // while dst[1] = 0 provides a safe in-bounds row index for any chained ggml_get_rows step.
             dst[0] = -1;
             dst[1] = 0;
+            dst[2] = 0;
         }
     }
 }

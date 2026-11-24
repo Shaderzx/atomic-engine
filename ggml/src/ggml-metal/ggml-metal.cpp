@@ -345,7 +345,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                         (size_t) GGML_METAL_INKLING_FA_SPLIT_MAX_NWG * 24u *
                         (size_t) tensor->src[0]->ne[2] * GGML_METAL_INKLING_FA_SPLIT_STRIDE * sizeof(float);
                 } else if (tag == GGML_METAL_INKLING_DSPARK_ARGMAX) {
-                    res = GGML_PAD(res, 16) + 256u * 2u * sizeof(uint32_t);
+                    res = GGML_PAD(res, 16) + 256u * 4u * sizeof(uint32_t);
                 } else if (tag == GGML_METAL_INKLING_MOE_FFN && tensor->src[2]) {
                     const size_t n_ff = (size_t)(tensor->src[2]->ne[1] / 2);
                     res = GGML_PAD(res, 64) +
@@ -1235,7 +1235,7 @@ static bool ggml_backend_metal_inkling_dspark_argmax_ready_v2(ggml_backend_t bac
     if (!ggml_backend_is_metal(backend) || rank <= 0 || rank > 512 || (rank % 32) != 0) {
         return false;
     }
-    if (w2_type == GGML_TYPE_Q8_0) {
+    if (w2_type == GGML_TYPE_Q4_0 || w2_type == GGML_TYPE_Q8_0) {
         return true;
     }
     if (w2_type == GGML_TYPE_BF16) {
@@ -1251,7 +1251,7 @@ static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v2(ggml_context * 
         ggml_tensor * latent, ggml_tensor * shortlist_ids, float cap) {
     if (!w2 || !w2_b || !base_row || !latent ||
             !std::isfinite(cap) || cap < 0.0f ||
-            (w2->type != GGML_TYPE_Q8_0 && w2->type != GGML_TYPE_BF16) ||
+            (w2->type != GGML_TYPE_Q4_0 && w2->type != GGML_TYPE_Q8_0 && w2->type != GGML_TYPE_BF16) ||
             !ggml_is_contiguous(w2) || w2->ne[2] != 1 || w2->ne[3] != 1 ||
             w2->ne[0] <= 0 || w2->ne[0] > 512 || w2->ne[0] % 32 != 0 || w2->ne[1] <= 0 ||
             w2->nb[1] != ggml_row_size(w2->type, w2->ne[0]) ||
@@ -1265,8 +1265,9 @@ static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v2(ggml_context * 
         return nullptr;
     }
     ggml_tensor * args[] = {w2, w2_b, base_row, latent, shortlist_ids};
-    // Output [2]: elem 0 = raw token ID (or -1 on all-NaN), elem 1 = safe in-bounds index (0 on all-NaN) for chained ggml_get_rows.
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_I32, 2, 1, 1, 1, args, shortlist_ids ? 5 : 4,
+    // Output [3]: elem 0 = raw token ID (or -1 on all-NaN), elem 1 = safe in-bounds index (0 on all-NaN),
+    // elem 2 = float bits of top1 - top2 softcapped logit margin (0 on tie / all-NaN).
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_I32, 3, 1, 1, 1, args, shortlist_ids ? 5 : 4,
             +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling DSpark argmax requires Metal"); }, 1, nullptr);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, cap);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_DSPARK_ARGMAX;

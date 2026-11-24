@@ -2680,8 +2680,8 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
         }
         // Resident Metal fused direct per-slot MoE FFN (gate_up + SiTU + down):
-        // M = 1..11 for Q4_0, M = 1..7 for Q4_K/IQ2_XXS (where mul_mm_id takes over at M >= 8).
-        const int64_t moe_max_tokens = (gate_up_exps && gate_up_exps->type == GGML_TYPE_Q4_0) ? 11 : 7;
+        // M = 1..5 for IQ2_XXS (mul_mm_id wins at M >= 6), M = 1..7 for Q4_0/Q4_K (mul_mm_id wins at M >= 8).
+        const int64_t moe_max_tokens = (gate_up_exps && gate_up_exps->type == GGML_TYPE_IQ2_XXS) ? 5 : 7;
         if (!expert_executor && !cparams.cb_eval && arch == LLM_ARCH_INKLING2_LOOP && type_op == LLM_FFN_SITU && !mm_ids &&
                 gate_up_exps && down_exps && !gate_up_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
                 loras->empty() && n_tokens >= 1 && n_tokens <= moe_max_tokens &&

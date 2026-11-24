@@ -1563,9 +1563,13 @@ private:
                 params_base.speculative.draft.atomic_adaptive_dflash =
                     adaptive && std::strcmp(adaptive, "1") == 0 && common_atomic_dflash2_enabled(params_base);
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
-                if (spec && params_base.speculative.draft.atomic_adaptive_dflash) {
+                if (spec) {
                     const char * timed = std::getenv("LLAMA_EXPERIMENTAL_DFLASH2_TIMED_COST");
-                    if (timed && std::strcmp(timed, "1") == 0) {
+                    const char * inkling_adapt = std::getenv("LLAMA_INKLING_ADAPTIVE_K");
+                    const bool has_dspark = std::find(params_base.speculative.types.begin(),
+                            params_base.speculative.types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
+                    if ((params_base.speculative.draft.atomic_adaptive_dflash && timed && std::strcmp(timed, "1") == 0) ||
+                            (params_base.n_parallel == 1 && has_dspark && inkling_adapt && std::strcmp(inkling_adapt, "1") == 0)) {
                         atomic_dflash_cost = std::make_unique<common_atomic_dflash_cost>();
                     }
                 }
@@ -4791,10 +4795,9 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
-        // In the budgeted single-slot profile, time only whole greedy target batches.
+        // Time whole single-slot target verification batches for online verify row_cost estimation.
         const bool measure_verify = atomic_dflash_cost && has_output && off == 0 && batch.view.size() == batch.size() &&
                 !batch.tokens[off].is_prompt && batch.slot_batched && batch.slot_batched->state == SLOT_STATE_GENERATING &&
-                batch.slot_batched->task->params.sampling.temp == 0.0f &&
                 (batch.slot_batched->n_remaining() == -1 ||
                  batch.slot_batched->n_remaining() > params_base.speculative.draft.n_max);
         int64_t verify_us = 0;

@@ -134,7 +134,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
         const llama_model_dflash & dmodel,
         const llama_model & target,
         int64_t req_vocab,
-        bool want_q8) {
+        ggml_type want_w2_type) {
     const int64_t n_vocab_full = dmodel.hparams.n_vocab_unpadded;
     const int64_t rank         = dmodel.dspark_markov_w1 ? dmodel.dspark_markov_w1->ne[0] : 0;
     const int64_t n_embd       = dmodel.hparams.n_embd;
@@ -146,7 +146,8 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     }
 
     const bool use_short = req_vocab < n_vocab_full;
-    if (!use_short && !want_q8) {
+    const bool quant_w2  = want_w2_type == GGML_TYPE_Q4_0 || want_w2_type == GGML_TYPE_Q8_0;
+    if (!use_short && !quant_w2) {
         return nullptr;
     }
     if (!dmodel.dev_output() || !dmodel.dspark_markov_w2 || !dmodel.dspark_markov_w2_b ||
@@ -162,7 +163,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
                 entry->target_ne0 == target.output->ne[0] &&
                 entry->target_ne1 == target.output->ne[1] &&
                 entry->req_vocab == req_vocab &&
-                entry->w2_q8 == want_q8) {
+                entry->w2_type == want_w2_type) {
             return entry;
         }
     }
@@ -213,7 +214,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     entry->target_ne1         = target.output->ne[1];
     entry->req_vocab          = req_vocab;
     entry->eff_vocab          = eff_vocab;
-    entry->w2_q8              = want_q8;
+    entry->w2_type            = want_w2_type;
 
     const int n_tensors = use_short ? 4 : 1;
     ggml_init_params init_p = {
@@ -224,7 +225,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     entry->ctx.reset(ggml_init(init_p));
     if (!entry->ctx) { return nullptr; }
 
-    const ggml_type w2_type = want_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16;
+    const ggml_type w2_type = quant_w2 ? want_w2_type : GGML_TYPE_BF16;
     entry->w2_fast = ggml_new_tensor_2d(entry->ctx.get(), w2_type, rank, eff_vocab);
     ggml_set_name(entry->w2_fast, "dspark_markov_w2_fast");
 
@@ -250,18 +251,18 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
 
         const size_t dst_row_bytes = ggml_row_size(w2_type, rank);
         std::vector<uint8_t> w2_dst((size_t) eff_vocab * dst_row_bytes);
-        std::vector<float> f32_row(want_q8 ? (size_t) rank : 0);
+        std::vector<float> f32_row(quant_w2 ? (size_t) rank : 0);
 
         for (int64_t i = 0; i < eff_vocab; ++i) {
             const int64_t src_id = use_short ? (int64_t) selected_ids[(size_t) i] : i;
             const uint16_t * src_row = w2_bf16.data() + (size_t) src_id * (size_t) rank;
             uint8_t * dst_row = w2_dst.data() + (size_t) i * dst_row_bytes;
-            if (want_q8) {
+            if (quant_w2) {
                 for (int64_t k = 0; k < rank; ++k) {
                     const uint32_t bits = uint32_t(src_row[k]) << 16;
                     std::memcpy(&f32_row[(size_t) k], &bits, sizeof(float));
                 }
-                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32_row.data(), dst_row, 0, 1, rank, nullptr);
+                ggml_quantize_chunk(w2_type, f32_row.data(), dst_row, 0, 1, rank, nullptr);
             } else {
                 std::memcpy(dst_row, src_row, dst_row_bytes);
             }
@@ -496,13 +497,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             if (ready_fn && argmax_fn && dspark_backend) {
                 const char * sl_env = std::getenv("LLAMA_INKLING_DSPARK_SHORTLIST");
                 const int64_t want_vocab = sl_env ? std::atoll(sl_env) : 0;
+                const char * q4_env = std::getenv("LLAMA_INKLING_DSPARK_W2_Q4");
                 const char * q8_env = std::getenv("LLAMA_INKLING_DSPARK_W2_Q8");
-                const bool want_q8 = !q8_env || std::strcmp(q8_env, "0") != 0;
-                const ggml_type planned_w2 = want_q8 ? GGML_TYPE_Q8_0 : model.dspark_markov_w2->type;
+                const bool want_q4 = q4_env && std::strcmp(q4_env, "1") == 0;
+                const bool want_q8 = !want_q4 && (!q8_env || std::strcmp(q8_env, "0") != 0);
+                const ggml_type planned_w2 = want_q4 ? GGML_TYPE_Q4_0
+                                           : want_q8 ? GGML_TYPE_Q8_0
+                                                     : model.dspark_markov_w2->type;
 
                 if (ready_fn(dspark_backend, rank, planned_w2)) {
                     const auto & dmodel = static_cast<const llama_model_dflash &>(model);
-                    const auto fh = ensure_inkling_fast_head(dmodel, *target, want_vocab, want_q8);
+                    const auto fh = ensure_inkling_fast_head(dmodel, *target, want_vocab, planned_w2);
 
                     ggml_tensor * output_w      = (fh && fh->output_short)  ? fh->output_short  : target->output;
                     ggml_tensor * w2_w          = (fh && fh->w2_fast)       ? fh->w2_fast       : model.dspark_markov_w2;
@@ -522,7 +527,8 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                         auto * context = ggml_view_2d(ctx0, f_rnn, n_embd, 1, f_rnn->nb[1], 0);
                         auto * prev    = ids;
 
-                        ggml_tensor * ids_vec = nullptr;
+                        ggml_tensor * ids_vec     = nullptr;
+                        ggml_tensor * margins_vec = nullptr;
                         bool fast_ok = true;
                         for (int64_t d = 0; d < n_draft; ++d) {
                             auto * hidden = ggml_view_2d(ctx0, cur, n_embd, 1, cur->nb[1], (d + 1) * cur->nb[1]);
@@ -539,22 +545,27 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
 
                             auto * base_row   = ggml_view_1d(ctx0, base_fast, v_eff, d * base_fast->nb[1]);
                             auto * argmax_out = argmax_fn(ctx0, w2_w, w2_b_w, base_row, latent, shortlist_ids, cap);
-                            if (!argmax_out || argmax_out->type != GGML_TYPE_I32 || ggml_nelements(argmax_out) < 2 ||
+                            if (!argmax_out || argmax_out->type != GGML_TYPE_I32 || ggml_nelements(argmax_out) < 3 ||
                                     !ggml_backend_supports_op(dspark_backend, argmax_out)) {
                                 fast_ok = false;
                                 break;
                             }
                             ggml_backend_sched_set_tensor_backend(sched, argmax_out, dspark_backend);
-                            // Elem 0 holds raw token ID (-1 on all-NaN) for host; elem 1 holds safe clamped index (>= 0) for next step's ggml_get_rows.
-                            auto * raw_id = ggml_view_1d(ctx0, argmax_out, 1, 0);
-                            prev          = ggml_view_1d(ctx0, argmax_out, 1, sizeof(int32_t));
-                            ids_vec = ids_vec ? ggml_concat(ctx0, ids_vec, raw_id, 0) : raw_id;
+                            // Elem 0 = raw token ID (-1 on all-NaN); elem 1 = safe clamped index (>= 0); elem 2 = float bits of top1-top2 margin.
+                            auto * raw_id  = ggml_view_1d(ctx0, argmax_out, 1, 0);
+                            prev           = ggml_view_1d(ctx0, argmax_out, 1, sizeof(int32_t));
+                            auto * margin  = ggml_view_1d(ctx0, argmax_out, 1, 2 * sizeof(int32_t));
+                            ids_vec        = ids_vec     ? ggml_concat(ctx0, ids_vec, raw_id, 0)         : raw_id;
+                            margins_vec    = margins_vec ? ggml_concat(ctx0, margins_vec, margin, 0)     : margin;
                         }
 
-                        if (fast_ok && ids_vec) {
-                            res->t_draft_ids = ids_vec;
+                        if (fast_ok && ids_vec && margins_vec) {
+                            auto * packed = ggml_concat(ctx0,
+                                    ggml_reshape_2d(ctx0, ids_vec, n_draft, 1),
+                                    ggml_reshape_2d(ctx0, margins_vec, n_draft, 1), 1);
+                            res->t_draft_ids = packed;
                             res->t_logits    = nullptr;
-                            ggml_build_forward_expand(gf, ids_vec);
+                            ggml_build_forward_expand(gf, packed);
                             return;
                         }
                     }

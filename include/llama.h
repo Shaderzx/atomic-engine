@@ -1231,6 +1231,9 @@ extern "C" {
     // Copy GPU-selected draft token IDs from the most recent decode into `out` (up to `max_n`).
     // Returns the number of IDs produced (>= 0), or -1 if the last decode did not use the fast draft-ID path.
     LLAMA_API int32_t llama_get_draft_ids(struct llama_context * ctx, llama_token * out, int32_t max_n);
+    // Copy top1-top2 logit margins (in softcapped logit units, >= 0) aligned with llama_get_draft_ids().
+    // Returns the number of margins produced (>= 0), or -1 if unavailable.
+    LLAMA_API int32_t llama_get_draft_margins(struct llama_context * ctx, float * out, int32_t max_n);
 
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);

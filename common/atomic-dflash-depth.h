@@ -75,8 +75,8 @@ private:
 
 class common_atomic_dflash_depth {
 public:
-    // The budgeted DFlash2 profile admits at most six draft rows.
-    static constexpr std::size_t capacity = 6;
+    // Up to 7 draft rows (block_size=8 for Inkling2 DSpark; 6 for budgeted DFlash2).
+    static constexpr std::size_t capacity = 7;
 
 private:
     struct observations {
@@ -90,15 +90,16 @@ private:
     unsigned rounds = 0;
 
 public:
-    std::size_t choose(const float * confidence, std::size_t offered, std::size_t minimum, float measured_row_cost) {
+    std::size_t choose(const float * confidence, std::size_t offered, std::size_t minimum, float measured_row_cost, float draft_ratio = 0.0f) {
         pending_depth = 0;
         if (offered == 0) {
             return 0;
         }
+        offered = std::min(offered, capacity);
 
         float survival = 1.0f;
         float expected_tokens = 1.0f; // the target also emits a correction or bonus token
-        float best_rate = 1.0f;
+        float best_rate = 1.0f / (1.0f + draft_ratio);
         const float row_cost = measured_row_cost >= 0.0f ? measured_row_cost : common_atomic_dflash_cost::prior;
         for (std::size_t i = 0; i < offered; ++i) {
             const float p = confidence[i];
@@ -114,7 +115,7 @@ public:
 
             // Cost in units of one ordinary decode step. A verification batch shares some
             // target work, but another row still adds routed expert reads.
-            const float rate = expected_tokens / (1.0f + row_cost * (i + 1));
+            const float rate = expected_tokens / (1.0f + draft_ratio + row_cost * (i + 1));
             if (i + 1 >= minimum && rate > best_rate) {
                 best_rate = rate;
                 pending_depth = i + 1;

@@ -1878,9 +1878,21 @@ int32_t llama_context::get_draft_ids(llama_token * out, int32_t max_n) {
         return -1;
     }
     synchronize();
-    const int32_t n = std::min<int32_t>((int32_t) draft_ids.size(), std::max<int32_t>(0, max_n));
+    const int32_t n = std::min<int32_t>(draft_n, std::max<int32_t>(0, max_n));
     if (out && n > 0) {
         std::memcpy(out, draft_ids.data(), (size_t) n * sizeof(llama_token));
+    }
+    return n;
+}
+
+int32_t llama_context::get_draft_margins(float * out, int32_t max_n) {
+    if (!has_draft_ids || !draft_has_margins) {
+        return -1;
+    }
+    synchronize();
+    const int32_t n = std::min<int32_t>(draft_n, std::max<int32_t>(0, max_n));
+    if (out && n > 0) {
+        std::memcpy(out, draft_ids.data() + draft_n, (size_t) n * sizeof(float));
     }
     return n;
 }
@@ -2167,6 +2179,8 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
     }
     embd_seq.clear();
     has_draft_ids = false;
+    draft_n = 0;
+    draft_has_margins = false;
     draft_ids.clear();
 
     if (t_compute_start_us == 0) {
@@ -2521,6 +2535,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
     }
     embd_seq.clear();
     has_draft_ids = false;
+    draft_n = 0;
+    draft_has_margins = false;
     draft_ids.clear();
 
     if (t_compute_start_us == 0) {
@@ -2946,15 +2962,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
             }
         }
 
-        // extract typed GPU-selected draft token IDs when produced by the graph
+        // extract typed GPU-selected draft token IDs (and optional row-1 margin float bits) when produced by the graph
         if (auto * t_draft_ids = res->get_draft_ids()) {
             GGML_ASSERT(t_draft_ids->type == GGML_TYPE_I32);
             ggml_backend_t backend_draft = ggml_backend_sched_get_tensor_backend(sched.get(), t_draft_ids);
             GGML_ASSERT(backend_draft != nullptr);
-            const int64_t n_draft = ggml_nelements(t_draft_ids);
-            draft_ids.resize((size_t) n_draft);
-            if (n_draft > 0) {
-                ggml_backend_tensor_get_async(backend_draft, t_draft_ids, draft_ids.data(), 0, (size_t) n_draft * sizeof(llama_token));
+            const int64_t n_total = ggml_nelements(t_draft_ids);
+            draft_n = (int32_t) t_draft_ids->ne[0];
+            draft_has_margins = t_draft_ids->ne[1] >= 2 && n_total >= 2 * t_draft_ids->ne[0];
+            draft_ids.resize((size_t) n_total);
+            if (n_total > 0) {
+                ggml_backend_tensor_get_async(backend_draft, t_draft_ids, draft_ids.data(), 0, (size_t) n_total * sizeof(int32_t));
             }
             has_draft_ids = true;
         }
@@ -5294,6 +5312,10 @@ void llama_set_dspark_fast_argmax(llama_context * ctx, bool value) {
 
 int32_t llama_get_draft_ids(llama_context * ctx, llama_token * out, int32_t max_n) {
     return ctx->get_draft_ids(out, max_n);
+}
+
+int32_t llama_get_draft_margins(llama_context * ctx, float * out, int32_t max_n) {
+    return ctx->get_draft_margins(out, max_n);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

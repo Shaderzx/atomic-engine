@@ -561,8 +561,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         if (gate_up->type == GGML_TYPE_IQ2_XXS) {
                             ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 2240, 0);
                         }
-                        const uint32_t rows_per_tg = gate_up->type == GGML_TYPE_Q4_K ? 4u : 8u;
-                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_ff + rows_per_tg - 1u) / rows_per_tg, n_slots, 1, 32, 4, 1);
+                        const uint32_t gu_nsg = gate_up->type == GGML_TYPE_Q4_0 ? 2u : 4u;
+                        const uint32_t rows_per_tg = gate_up->type == GGML_TYPE_IQ2_XXS ? 8u : 4u;
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_ff + rows_per_tg - 1u) / rows_per_tg, n_slots, 1, 32, gu_nsg, 1);
                         ggml_metal_op_concurrency_reset(ctx);
                     }
 
@@ -584,7 +585,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         if (down->type == GGML_TYPE_IQ4_NL) {
                             ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 64, 0);
                         }
-                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_embd + 15u) / 16u, n_slots, 1, 32, 4, 1);
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_embd + 7u) / 8u, n_slots, 1, 32, 2, 1);
                     }
                     break;
                 }
@@ -629,7 +630,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     break;
                 }
                 if (tag == GGML_METAL_INKLING_DSPARK_ARGMAX) {
-                    const char * k1 = node->src[0]->type == GGML_TYPE_Q8_0
+                    const char * k1 = node->src[0]->type == GGML_TYPE_Q4_0
+                            ? "kernel_inkling_dspark_argmax_s1_q4_0"
+                            : node->src[0]->type == GGML_TYPE_Q8_0
                             ? "kernel_inkling_dspark_argmax_s1_q8_0"
                             : "kernel_inkling_dspark_argmax_s1_bf16";
                     const char * k2 = "kernel_inkling_dspark_argmax_s2";

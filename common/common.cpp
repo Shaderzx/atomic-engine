@@ -1796,12 +1796,55 @@ struct llama_model * common_model_load(const std::vector<std::string> & paths, c
     return llama_model_load_from_splits(c_paths.data(), c_paths.size(), mparams);
 }
 
+int32_t common_inkling_prompt_lookup_max(bool engine_budget) {
+    if (engine_budget) {
+        return 0;
+    }
+    const char * lookup = std::getenv("LLAMA_INKLING_PROMPT_LOOKUP");
+    const char * legacy = std::getenv("LLAMA_EXPERIMENTAL_INKLING_PROMPT_LOOKUP");
+    const bool enabled = lookup ? (std::strcmp(lookup, "0") != 0)
+                       : legacy ? (std::strcmp(legacy, "0") != 0)
+                       : true;
+    if (!enabled) {
+        return 0;
+    }
+    const char * max_env = std::getenv("LLAMA_INKLING_PROMPT_LOOKUP_MAX");
+    const int32_t v = max_env ? std::atoi(max_env) : 15;
+    return std::max<int32_t>(0, std::min<int32_t>(v, 16));
+}
+
+uint32_t common_params_speculative::need_n_rs_seq(bool engine_budget) const {
+    bool needs_rs_seq = false;
+    bool has_dspark   = false;
+    for (auto t : types) {
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP     ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3  ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH  ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK  ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2 ||
+            t == COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR) {
+            needs_rs_seq = true;
+        }
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+            has_dspark = true;
+        }
+    }
+    if (!needs_rs_seq) {
+        return 0u;
+    }
+    int32_t res = std::max<int32_t>(0, draft.n_max);
+    if (has_dspark) {
+        res = std::max(res, common_inkling_prompt_lookup_max(engine_budget));
+    }
+    return (uint32_t) res;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
-    cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    cparams.n_rs_seq          = params.speculative.need_n_rs_seq(params.engine_budget);
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

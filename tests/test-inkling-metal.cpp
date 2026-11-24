@@ -489,16 +489,16 @@ int main(int argc, char ** argv) {
         }
     });
 
-    t.test("inkling_dspark_argmax Q8_0/BF16, shortlist, softcap first-max tie, and all-NaN -> -1", [&](testing & t) {
+    t.test("inkling_dspark_argmax Q4_0/Q8_0/BF16, shortlist, softcap first-max tie, top1-top2 margin, and all-NaN -> -1", [&](testing & t) {
         auto ready  = reinterpret_cast<dspark_ready_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_ready_v2"));
         auto create = reinterpret_cast<dspark_argmax_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v2"));
         t.assert_true(ready != nullptr && create != nullptr);
 
         // Unsupported rank must return false cleanly
         t.assert_true(!ready(backend, 513, GGML_TYPE_Q8_0));
-        t.assert_true(!ready(backend, 48,  GGML_TYPE_Q8_0));
+        t.assert_true(!ready(backend, 48,  GGML_TYPE_Q4_0));
 
-        for (ggml_type w2_type : {GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
+        for (ggml_type w2_type : {GGML_TYPE_Q4_0, GGML_TYPE_Q8_0, GGML_TYPE_BF16}) {
             if (!ready(backend, 128, w2_type)) { continue; }
             const int64_t rank = 128, vocab = 5003;
             auto w2_raw = rand_vec(rank * vocab, 501, -0.3f, 0.3f);
@@ -507,7 +507,7 @@ int main(int argc, char ** argv) {
             auto lat    = rand_vec(rank, 504, -1.0f, 1.0f);
 
             // Force a softcap-saturation tie: index 777 gets +500, index 2999 gets +900.
-            // After cap=30*tanh(s/30), both saturate to exact 30.0f so first-max must pick 777!
+            // After cap=30*tanh(s/30), both saturate to exact 30.0f so first-max must pick 777 and margin == 0!
             base[777]  = 500.0f;
             base[2999] = 900.0f;
             // Also inject NaN at index 100 to verify NaN is ignored.
@@ -517,7 +517,7 @@ int main(int argc, char ** argv) {
             std::vector<float> w2_ref;
             quantize_and_dequant(w2_type, w2_raw, vocab, rank, w2_bytes, w2_ref);
 
-            // 1. Direct softcap first-max tie test
+            // 1. Direct softcap first-max tie test (margin must be 0.0f)
             {
                 ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
                 auto * tw2   = ggml_new_tensor_2d(ctx.get(), w2_type, rank, vocab);
@@ -527,14 +527,54 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, nullptr, 30.0f);
                 t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
 
-                int32_t out_ids[2] = {-999, -999};
+                int32_t out_ids[3] = {-999, -999, -999};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
                     {tbase, {base.data(),     base.size() * sizeof(float)}},
                     {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
                 }, out_ids, sizeof(out_ids));
-                t.assert_true(out_ids[0] == 777 && out_ids[1] == 777);
+                float margin = -1.0f;
+                std::memcpy(&margin, &out_ids[2], sizeof(float));
+                t.assert_true(out_ids[0] == 777 && out_ids[1] == 777 && margin == 0.0f);
+            }
+
+            // 1b. Exact top-1/top-2 margin parity against CPU dequant reference (no tie)
+            {
+                auto base_m = rand_vec(vocab, 513, -2.0f, 2.0f);
+                base_m[1234] = 8.5f;
+                base_m[3456] = 5.0f;
+                base_m[42]   = std::numeric_limits<float>::quiet_NaN();
+                double best1 = -1e30, best2 = -1e30;
+                int64_t best_idx = -1;
+                for (int64_t v = 0; v < vocab; ++v) {
+                    if (std::isnan(base_m[v])) { continue; }
+                    double dot = 0.0;
+                    for (int64_t k = 0; k < rank; ++k) { dot += (double) w2_ref[v * rank + k] * lat[k]; }
+                    double s = 30.0 * std::tanh((dot + w2_b[v] + base_m[v]) / 30.0);
+                    if (s > best1) { best2 = best1; best1 = s; best_idx = v; }
+                    else if (s > best2) { best2 = s; }
+                }
+                const float ref_margin = (float) std::max(0.0, best1 - best2);
+
+                ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
+                auto * tw2   = ggml_new_tensor_2d(ctx.get(), w2_type, rank, vocab);
+                auto * tw2b  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, vocab);
+                auto * tbase = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, vocab);
+                auto * tlat  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, rank);
+                auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, nullptr, 30.0f);
+                t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+                int32_t out_ids[3] = {-999, -999, -999};
+                run_graph(ctx.get(), out, {
+                    {tw2,   {w2_bytes.data(), w2_bytes.size()}},
+                    {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
+                    {tbase, {base_m.data(),   base_m.size() * sizeof(float)}},
+                    {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
+                }, out_ids, sizeof(out_ids));
+                float got_margin = -1.0f;
+                std::memcpy(&got_margin, &out_ids[2], sizeof(float));
+                t.assert_true(out_ids[0] == best_idx && out_ids[1] == best_idx && std::fabs(got_margin - ref_margin) < 1e-3f);
             }
 
             // 2. Shortlist remapping test
@@ -550,7 +590,7 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, tsl, 30.0f);
                 t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
 
-                int32_t out_ids[2] = {-999, -999};
+                int32_t out_ids[3] = {-999, -999, -999};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
@@ -572,14 +612,14 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, nullptr, 30.0f);
                 t.assert_true(out != nullptr);
 
-                int32_t out_ids[2] = {12345, 12345};
+                int32_t out_ids[3] = {12345, 12345, 12345};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
                     {tbase, {nan_base.data(), nan_base.size() * sizeof(float)}},
                     {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
                 }, out_ids, sizeof(out_ids));
-                t.assert_true(out_ids[0] == -1 && out_ids[1] == 0);
+                t.assert_true(out_ids[0] == -1 && out_ids[1] == 0 && out_ids[2] == 0);
             }
 
             // 4. 2-step chained DSpark graph where step 0 has all-NaN logits -> elem 1 (0) feeds ggml_get_rows safely

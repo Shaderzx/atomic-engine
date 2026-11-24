@@ -3605,7 +3605,7 @@ inline bool inkling_load_slot(
     return true;
 }
 
-// --- 1. gate_up + SiTU: Q4_0 (direct per-slot, zero plan barrier, zero load imbalance, NR0=2 pairs = 4 rows/sg) ---
+// --- 1. gate_up + SiTU: Q4_0 (direct per-slot, NSG=2 = 64 threads/TG matching N_SG_Q4_0, NR0=2 pairs = 4 rows/sg) ---
 kernel void kernel_inkling_moe_gate_up_situ_q4_0(
         constant inkling_moe_gu_args & args    [[buffer(0)]],
         device const char            * weights [[buffer(1)]],
@@ -3617,7 +3617,7 @@ kernel void kernel_inkling_moe_gate_up_situ_q4_0(
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     uint32_t expert_id, tok;
     if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
-    const uint32_t first_row = (tgpig.x * 4u + sg) * 2u;
+    const uint32_t first_row = (tgpig.x * 2u + sg) * 2u;
     if (first_row >= args.n_ff) { return; }
 
     const int nb = int(args.n_embd / QK4_0);
@@ -3759,7 +3759,7 @@ kernel void kernel_inkling_moe_gate_up_situ_q4_K(
     }
 }
 
-// --- 3. gate_up + SiTU: IQ2_XXS (direct per-slot, NR0=2 pairs = 4 rows/sg matching N_R0_IQ2_XXS=4, cached yl[32]) ---
+// --- 3. gate_up + SiTU: IQ2_XXS (direct per-slot, NSG=4, NR0=2 pairs = 4 rows/sg matching N_R0_IQ2_XXS=4, shmem LUT) ---
 kernel void kernel_inkling_moe_gate_up_situ_iq2_xxs(
         constant inkling_moe_gu_args & args    [[buffer(0)]],
         device const char            * weights [[buffer(1)]],
@@ -3842,7 +3842,7 @@ kernel void kernel_inkling_moe_down_q45(
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     uint32_t expert_id, tok;
     if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
-    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
 
     const int nb = int(args.n_ff / QK4_0);
@@ -3892,7 +3892,7 @@ kernel void kernel_inkling_moe_down_q2_0(
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     uint32_t expert_id, tok;
     if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
-    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
 
     const int nb = int(args.n_ff / QK2_0);
@@ -3936,7 +3936,7 @@ kernel void kernel_inkling_moe_down_iq4_nl(
 
     uint32_t expert_id, tok;
     if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
-    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
 
     const int nb = int(args.n_ff / QK4_NL);

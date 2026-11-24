@@ -1383,6 +1383,9 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
     // The recurrent head uses the anchor features from the injection.
     bool has_rnn_context = false;
     bool use_prompt_lookup = false;
+    int32_t prompt_lookup_max = 0;
+    bool last_was_prompt_lookup = false;
+    std::unique_ptr<common_atomic_dflash_depth> atomic_depth;
 
     static constexpr size_t  LOOKUP_BUCKETS   = 1u << 16; // 65536 * 16B = 1 MiB
     struct lookup_bucket {
@@ -1423,6 +1426,10 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             }
             if (use_prompt_lookup) {
                 lookup_table.resize(LOOKUP_BUCKETS);
+            }
+            const char * adapt_env = std::getenv("LLAMA_INKLING_ADAPTIVE_K");
+            if (adapt_env && std::strcmp(adapt_env, "1") == 0) {
+                atomic_depth = std::make_unique<common_atomic_dflash_depth>();
             }
         }
 
@@ -1469,6 +1476,24 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         });
 
         if (has_rnn_context) {
+            if (use_prompt_lookup) {
+                const int32_t env_max = common_inkling_prompt_lookup_max(false);
+                const uint32_t n_rs = llama_n_rs_seq(this->params.ctx_tgt);
+                const int32_t bound = n_rs > 0 ? std::max<int32_t>(this->params.n_max, (int32_t) n_rs) : this->params.n_max;
+                prompt_lookup_max = std::min(std::max(this->params.n_max, env_max), bound);
+                this->n_max = std::max(this->n_max, prompt_lookup_max);
+                const size_t need_rows = (size_t) std::max<int32_t>(block_size, prompt_lookup_max + 1) + 4;
+                if (need_rows > context_rows) {
+                    context_rows = need_rows;
+                    const size_t slots = (size_t) n_seq * context_rows;
+                    context_embd.resize(slots * (size_t) n_embd_dec);
+                    context_pos.assign(slots, -1);
+                }
+                LOG_INF("%s: - prompt_lookup_max=%d (n_rs_seq=%u, context_rows=%zu, adaptive_k=%s)\n",
+                        __func__, prompt_lookup_max, n_rs, context_rows, atomic_depth ? "true" : "false");
+            } else if (atomic_depth) {
+                LOG_INF("%s: - adaptive_k=true\n", __func__);
+            }
             // Inkling2 uses host sampling to keep the first-maximum tie rule.
             for (auto & s : smpls) {
                 common_params_sampling sparams;
@@ -1499,7 +1524,7 @@ protected:
         }
         const auto & history = *dp.prompt;
         const size_t L = history.size();
-        const size_t min_suffix = dp.temp <= 0.0f ? 8 : 12;
+        const size_t min_suffix = dp.temp <= 0.0f ? 5 : 8;
         if (L < min_suffix + 1) {
             return false;
         }
@@ -1553,8 +1578,11 @@ protected:
             return false;
         }
 
-        // Respect params.n_max so we never exceed ctx_tgt's reserved n_outputs_max / backend sampling slots.
-        const int32_t max_count = dp.n_max < 0 ? params.n_max : std::min(dp.n_max, params.n_max);
+        // Scale proposed draft length with matched suffix confidence so short 5-7 token
+        // code-edit matches verify cheaply (d=0ms) while >=8 token matches hit mul_mm_id (15 tokens).
+        const int32_t cap_max   = prompt_lookup_max > 0 ? prompt_lookup_max : params.n_max;
+        const int32_t conf_cap  = best_matched >= 8 ? cap_max : (best_matched >= 6 ? std::min(cap_max, 8) : std::min(cap_max, 4));
+        const int32_t max_count = dp.n_max < 0 ? conf_cap : std::min(dp.n_max, conf_cap);
         const int32_t avail     = (int32_t) std::min<size_t>(L - best_end, (size_t) std::max(0, max_count));
         const int32_t count     = avail;
         if (count < std::max(1, params.n_min)) {
@@ -1601,10 +1629,20 @@ public:
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+        last_was_prompt_lookup = false;
+        if (atomic_depth) {
+            *atomic_depth = {};
+        }
         if (use_prompt_lookup && !lookup_table.empty()) {
             std::memset(lookup_table.data(), 0, lookup_table.size() * sizeof(lookup_bucket));
             lookup_indexed = 0;
             lookup_tok0 = lookup_tok_mid = lookup_tok_end = LLAMA_TOKEN_NULL;
+        }
+    }
+
+    void accept(llama_seq_id /*seq_id*/, uint16_t n_accepted, bool is_other) override {
+        if (atomic_depth && !is_other && !last_was_prompt_lookup) {
+            atomic_depth->observe(n_accepted);
         }
     }
 
@@ -1626,8 +1664,10 @@ public:
             }
 
             if (use_prompt_lookup && draft_from_prompt(dp)) {
+                last_was_prompt_lookup = true;
                 continue;
             }
+            last_was_prompt_lookup = false;
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
@@ -1656,6 +1696,7 @@ public:
             return;
         }
 
+        const int64_t t_draft0 = ggml_time_us();
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
@@ -1692,6 +1733,32 @@ public:
                     }
                     if (result.size() < (size_t) params.n_min) {
                         result.clear();
+                    }
+                    if (atomic_depth && !result.empty()) {
+                        std::array<float, common_atomic_dflash_depth::capacity> margins{};
+                        std::array<float, common_atomic_dflash_depth::capacity> conf{};
+                        const int32_t n_m = llama_get_draft_margins(ctx_dft, margins.data(), (int32_t) std::min(result.size(), margins.size()));
+                        if (n_m > 0) {
+                            const size_t offered = std::min<size_t>(
+                                    dp.n_max > 0 ? std::min(result.size(), (size_t) dp.n_max) : result.size(),
+                                    (size_t) n_m);
+                            for (size_t k = 0; k < offered; ++k) {
+                                const float m = std::isfinite(margins[k]) ? std::max(0.0f, margins[k]) : 0.0f;
+                                conf[k] = 1.0f / (1.0f + std::exp(-m));
+                            }
+                            if (offered >= (size_t) params.n_min) {
+                                result.resize(atomic_depth->choose(conf.data(), offered, params.n_min, dp.atomic_verify_row_cost, 0.15f));
+                            }
+                        }
+                    }
+                    static const bool prof_spec = []() {
+                        const char * v = std::getenv("LLAMA_INKLING_PROFILE_SPEC");
+                        return v && std::strcmp(v, "1") == 0;
+                    }();
+                    if (prof_spec) {
+                        const double d_ms = (ggml_time_us() - t_draft0) / 1000.0;
+                        std::fprintf(stderr, "inkling_spec_prof: draft_ms=%.2f k_sent=%zu row_cost=%.3f\n",
+                                d_ms, result.size(), dp.atomic_verify_row_cost);
                     }
                     continue;
                 }
@@ -3169,6 +3236,8 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
             case COMMON_SPECULATIVE_TYPE_DRAFT_MTP:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH:
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK:
+                n_max = std::max(n_max, std::max(std::max(0, spec->draft.n_max), common_inkling_prompt_lookup_max(false)));
+                break;
             case COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH2:
             case COMMON_SPECULATIVE_TYPE_DRAFT_LILICORR:
                 n_max = std::max(n_max, std::max(0, spec->draft.n_max));
