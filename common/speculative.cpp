@@ -1248,6 +1248,7 @@ public:
                                 __func__, rc, (int) n_chunk, (int) offset);
                         return false;
                     }
+                    store_context_features(seq_id, n_chunk);
                     continue;
                 }
 
@@ -1430,11 +1431,11 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
         LOG_INF("%s: - sample_from_anchor=%s\n", __func__, sample_from_anchor ? "true" : "false");
 
         // anchor-first DSpark yields a full block_size draft tokens
-        // the recurrent head reads the context features back from h_nextn after a host copy injection
+        // Inkling2 DSpark reads layer features directly from the target device buffer and stores h_nextn context rows
         init({
             /* .n_draft_max      = */ sample_from_anchor ? block_size : block_size - 1,
             /* .backend_sampling = */ !has_rnn_context,
-            /* .dev_features     = */ !has_rnn_context,
+            /* .dev_features     = */ true,
             /* .nextn_masked     = */ !has_rnn_context,
         });
 
@@ -1564,6 +1565,24 @@ public:
             auto * smpl = smpls[seq_id].get();
 
             auto & result = *dp.result;
+
+            // Inkling2 fast GPU argmax path packs the predicted token IDs directly into h_nextn
+            // with sentinel -1337.0f, avoiding 200K-vocab logit readback and host sampling.
+            if (has_rnn_context && n_seq == 1) {
+                const float * fast_ids = llama_get_embeddings_nextn(ctx_dft);
+                if (fast_ids && fast_ids[0] == -1337.0f) {
+                    const int32_t n_packed = (int32_t) std::lrintf(fast_ids[1]);
+                    const int32_t n_take = std::min(params.n_max, n_packed);
+                    for (int32_t k = 0; k < n_take; ++k) {
+                        const llama_token id = (llama_token) std::lrintf(fast_ids[2 + k]);
+                        result.push_back(id);
+                    }
+                    if (result.size() < (size_t) params.n_min) {
+                        result.clear();
+                    }
+                    continue;
+                }
+            }
 
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;

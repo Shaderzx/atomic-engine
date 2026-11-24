@@ -6,8 +6,13 @@
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
 
+#include <algorithm>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
+#include <numeric>
+#include <vector>
 
 void llama_model_dflash::load_hparams_inkling2(llama_model_loader & ml) {
     // PR #32218 at e4b1cb5318f1 exports W2 over the true vocabulary and includes
@@ -119,6 +124,163 @@ void llama_model_dflash::load_tensors_inkling2() {
 }
 
 using inkling_mark_add = void (*)(ggml_tensor *);
+using inkling_dspark_argmax_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
+
+static void ensure_inkling_fast_head(
+        const llama_model_dflash & dmodel,
+        const llama_model & target,
+        int64_t want_vocab,
+        bool want_q8) {
+    std::lock_guard<std::mutex> lock(dmodel.inkling_head_mtx);
+    auto & head = dmodel.inkling_head;
+    const int64_t n_vocab_full = dmodel.hparams.n_vocab_unpadded;
+    const int64_t rank         = dmodel.dspark_markov_w1->ne[0];
+    const int64_t n_embd       = dmodel.hparams.n_embd;
+
+    if (want_vocab <= 0 || want_vocab >= n_vocab_full) {
+        want_vocab = n_vocab_full;
+    } else if (want_vocab < 1024) {
+        want_vocab = std::min<int64_t>(1024, n_vocab_full);
+    }
+
+    if (head.target == &target && head.n_vocab == want_vocab && head.w2_q8 == want_q8) {
+        return;
+    }
+
+    head.output_short  = nullptr;
+    head.w2_fast       = nullptr;
+    head.w2_b_fast     = nullptr;
+    head.shortlist_ids = nullptr;
+    head.buf.reset();
+    head.ctx.reset();
+    head.target  = &target;
+    head.n_vocab = want_vocab;
+    head.w2_q8   = want_q8;
+
+    const bool use_short = want_vocab < n_vocab_full;
+    if (!use_short && !want_q8) {
+        return;
+    }
+    if (!dmodel.dev_output() || !dmodel.dspark_markov_w2 || !dmodel.dspark_markov_w2_b ||
+            dmodel.dspark_markov_w2->type != GGML_TYPE_BF16 || !target.output) {
+        return;
+    }
+
+    const int64_t t0 = ggml_time_us();
+
+    std::vector<int32_t> selected_ids;
+    std::vector<float> bias_full;
+    if (use_short) {
+        bias_full.resize((size_t) n_vocab_full);
+        ggml_backend_tensor_get(dmodel.dspark_markov_w2_b, bias_full.data(), 0, bias_full.size() * sizeof(float));
+
+        std::vector<uint8_t> pinned((size_t) n_vocab_full, 0);
+        selected_ids.reserve((size_t) want_vocab);
+        std::vector<int32_t> candidates;
+        candidates.reserve((size_t) n_vocab_full);
+
+        for (int32_t id = 0; id < (int32_t) n_vocab_full; ++id) {
+            if (id < 256 || dmodel.vocab.is_control(id) || dmodel.vocab.is_eog(id)) {
+                pinned[(size_t) id] = 1;
+                selected_ids.push_back(id);
+            } else {
+                candidates.push_back(id);
+            }
+        }
+        if ((int64_t) selected_ids.size() < want_vocab && !candidates.empty()) {
+            const size_t need = std::min(candidates.size(), (size_t) want_vocab - selected_ids.size());
+            std::nth_element(candidates.begin(), candidates.begin() + need, candidates.end(),
+                    [&](int32_t a, int32_t b) {
+                        const float ba = bias_full[(size_t) a];
+                        const float bb = bias_full[(size_t) b];
+                        return ba != bb ? ba > bb : a < b;
+                    });
+            selected_ids.insert(selected_ids.end(), candidates.begin(), candidates.begin() + need);
+        }
+        std::sort(selected_ids.begin(), selected_ids.end());
+        want_vocab = (int64_t) selected_ids.size();
+        head.n_vocab = want_vocab;
+    }
+
+    const int n_tensors = use_short ? 4 : 1;
+    ggml_init_params init_p = {
+        /* .mem_size   = */ (size_t) n_tensors * ggml_tensor_overhead() + 1024,
+        /* .mem_buffer = */ nullptr,
+        /* .no_alloc   = */ true,
+    };
+    head.ctx.reset(ggml_init(init_p));
+    if (!head.ctx) { return; }
+
+    const ggml_type w2_type = want_q8 ? GGML_TYPE_Q8_0 : GGML_TYPE_BF16;
+    head.w2_fast = ggml_new_tensor_2d(head.ctx.get(), w2_type, rank, want_vocab);
+    ggml_set_name(head.w2_fast, "dspark_markov_w2_fast");
+
+    if (use_short) {
+        head.output_short  = ggml_new_tensor_2d(head.ctx.get(), target.output->type, n_embd, want_vocab);
+        head.w2_b_fast     = ggml_new_tensor_1d(head.ctx.get(), GGML_TYPE_F32, want_vocab);
+        head.shortlist_ids = ggml_new_tensor_1d(head.ctx.get(), GGML_TYPE_I32, want_vocab);
+        ggml_set_name(head.output_short,  "dspark_output_short");
+        ggml_set_name(head.w2_b_fast,     "dspark_markov_w2_b_short");
+        ggml_set_name(head.shortlist_ids, "dspark_shortlist_ids");
+    }
+
+    auto * buft = ggml_backend_dev_buffer_type(dmodel.dev_output());
+    head.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(head.ctx.get(), buft));
+    if (!head.buf) {
+        head.output_short = head.w2_fast = head.w2_b_fast = head.shortlist_ids = nullptr;
+        head.ctx.reset();
+        return;
+    }
+
+    // Gather/quantize markov_w2
+    {
+        std::vector<uint16_t> w2_bf16((size_t) rank * (size_t) n_vocab_full);
+        ggml_backend_tensor_get(dmodel.dspark_markov_w2, w2_bf16.data(), 0, w2_bf16.size() * sizeof(uint16_t));
+
+        const size_t dst_row_bytes = ggml_row_size(w2_type, rank);
+        std::vector<uint8_t> w2_dst((size_t) want_vocab * dst_row_bytes);
+        std::vector<float> f32_row(want_q8 ? (size_t) rank : 0);
+
+        for (int64_t i = 0; i < want_vocab; ++i) {
+            const int64_t src_id = use_short ? (int64_t) selected_ids[(size_t) i] : i;
+            const uint16_t * src_row = w2_bf16.data() + (size_t) src_id * (size_t) rank;
+            uint8_t * dst_row = w2_dst.data() + (size_t) i * dst_row_bytes;
+            if (want_q8) {
+                for (int64_t k = 0; k < rank; ++k) {
+                    const uint32_t bits = uint32_t(src_row[k]) << 16;
+                    std::memcpy(&f32_row[(size_t) k], &bits, sizeof(float));
+                }
+                ggml_quantize_chunk(GGML_TYPE_Q8_0, f32_row.data(), dst_row, 0, 1, rank, nullptr);
+            } else {
+                std::memcpy(dst_row, src_row, dst_row_bytes);
+            }
+        }
+        ggml_backend_tensor_set(head.w2_fast, w2_dst.data(), 0, w2_dst.size());
+    }
+
+    if (use_short) {
+        const size_t out_row_bytes = ggml_row_size(target.output->type, n_embd);
+        std::vector<uint8_t> out_dst((size_t) want_vocab * out_row_bytes);
+        for (int64_t i = 0; i < want_vocab; ++i) {
+            const size_t src_off = (size_t) selected_ids[(size_t) i] * target.output->nb[1];
+            ggml_backend_tensor_get(target.output, out_dst.data() + (size_t) i * out_row_bytes, src_off, out_row_bytes);
+        }
+        ggml_backend_tensor_set(head.output_short, out_dst.data(), 0, out_dst.size());
+
+        std::vector<float> b_dst((size_t) want_vocab);
+        for (int64_t i = 0; i < want_vocab; ++i) {
+            b_dst[(size_t) i] = bias_full[(size_t) selected_ids[(size_t) i]];
+        }
+        ggml_backend_tensor_set(head.w2_b_fast, b_dst.data(), 0, b_dst.size() * sizeof(float));
+        ggml_backend_tensor_set(head.shortlist_ids, selected_ids.data(), 0, selected_ids.size() * sizeof(int32_t));
+    }
+
+    LLAMA_LOG_INFO("%s: built Inkling DSpark fast head (vocab=%lld/%lld, w2=%s, size=%.2f MiB, %.1f ms)\n",
+            __func__, (long long) want_vocab, (long long) n_vocab_full,
+            ggml_type_name(w2_type),
+            ggml_backend_buffer_get_size(head.buf.get()) / (1024.0 * 1024.0),
+            (ggml_time_us() - t0) / 1000.0);
+}
 
 static ggml_tensor * build_inkling2_head(llm_graph_context & g, const llama_model & model, const llama_model & target,
         ggml_tensor * prev, ggml_tensor * & state, ggml_tensor * hidden, ggml_tensor * base, ggml_tensor * context, inkling_mark_add mark_add) {
@@ -290,6 +452,83 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     }
     cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
     res->t_embd = cur;
+
+    // Fast GPU-argmax path for single-sequence Inkling2 DSpark drafting:
+    // projects only the active mask rows (1..head_rows-1) through an optional compact
+    // vocab shortlist + Q8_0 markov_w2, fuses w2*latent + w2_b + base + first-max argmax
+    // into a single Metal op, and returns only the predicted token IDs via t_h_nextn.
+    const int64_t head_rows = prefix_rows ? prefix_rows : block;
+    if (nb == 1 && block <= hparams.dflash_block_size && head_rows > 1 && head_rows <= block &&
+            model.dspark_markov_w2 && model.dspark_markov_w2_b && (!loras || loras->empty()) &&
+            !target->output_s && model.dev_output() &&
+            std::strcmp(ggml_backend_dev_name(model.dev_output()), "MTL0") == 0) {
+        const char * fast_env = std::getenv("LLAMA_INKLING_DSPARK_FAST");
+        if (!fast_env || std::strcmp(fast_env, "0") != 0) {
+            auto reg = ggml_backend_dev_backend_reg(model.dev_output());
+            auto argmax_fn = reinterpret_cast<inkling_dspark_argmax_fn>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v1"));
+            ggml_backend_t dspark_backend = nullptr;
+            for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                auto b = ggml_backend_sched_get_backend(sched, i);
+                if (ggml_backend_get_device(b) == model.dev_output()) { dspark_backend = b; break; }
+            }
+            if (argmax_fn && dspark_backend) {
+                const char * sl_env = std::getenv("LLAMA_INKLING_DSPARK_SHORTLIST");
+                const int64_t want_vocab = sl_env ? std::atoll(sl_env) : 0;
+                const char * q8_env = std::getenv("LLAMA_INKLING_DSPARK_W2_Q8");
+                const bool want_q8 = !q8_env || std::strcmp(q8_env, "0") != 0;
+
+                const auto & dmodel = static_cast<const llama_model_dflash &>(model);
+                ensure_inkling_fast_head(dmodel, *target, want_vocab, want_q8);
+
+                ggml_tensor * output_w      = dmodel.inkling_head.output_short  ? dmodel.inkling_head.output_short  : target->output;
+                ggml_tensor * w2_w          = dmodel.inkling_head.w2_fast       ? dmodel.inkling_head.w2_fast       : model.dspark_markov_w2;
+                ggml_tensor * w2_b_w        = dmodel.inkling_head.w2_b_fast     ? dmodel.inkling_head.w2_b_fast     : model.dspark_markov_w2_b;
+                ggml_tensor * shortlist_ids = dmodel.inkling_head.shortlist_ids;
+                const int64_t v_eff         = w2_w->ne[1];
+                const int64_t n_draft       = head_rows - 1;
+
+                auto * cur_active = ggml_view_2d(ctx0, cur, n_embd, n_draft, cur->nb[1], cur->nb[1]);
+                auto * base_fast  = build_lora_mm(output_w, cur_active, target->output_s);
+                ggml_prec_set_acc(base_fast, GGML_PREC_F32);
+
+                auto * state   = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, rank, 1), 0.0f);
+                auto * context = ggml_view_2d(ctx0, f_rnn, n_embd, 1, f_rnn->nb[1], 0);
+                auto * prev    = ids;
+
+                ggml_tensor * ids_vec = nullptr;
+                for (int64_t d = 0; d < n_draft; ++d) {
+                    auto * hidden = ggml_view_2d(ctx0, cur, n_embd, 1, cur->nb[1], (d + 1) * cur->nb[1]);
+                    auto * joint  = ggml_concat(ctx0, state, ggml_get_rows(ctx0, model.dspark_markov_w1, prev), 0);
+                    joint = ggml_concat(ctx0, joint, ggml_concat(ctx0, hidden, context, 0), 0);
+                    joint = ggml_add(ctx0, build_lora_mm(model.dspark_joint_proj, joint), model.dspark_joint_proj_b);
+                    const auto chunk = [&](int64_t j) {
+                        return ggml_cont(ctx0, ggml_view_2d(ctx0, joint, rank, 1, joint->nb[1], j * rank * joint->nb[0]));
+                    };
+                    auto * gate      = ggml_sigmoid(ctx0, chunk(0));
+                    auto * candidate = ggml_tanh(ctx0, chunk(1));
+                    state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
+                    auto * latent = ggml_tanh(ctx0, chunk(2));
+
+                    auto * base_row = ggml_view_1d(ctx0, base_fast, v_eff, d * base_fast->nb[1]);
+                    prev = argmax_fn(ctx0, w2_w, w2_b_w, base_row, latent, shortlist_ids);
+                    GGML_ASSERT(prev != nullptr);
+                    ggml_backend_sched_set_tensor_backend(sched, prev, dspark_backend);
+                    ids_vec = ids_vec ? ggml_concat(ctx0, ids_vec, prev, 0) : prev;
+                }
+
+                auto * hdr0   = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), -1337.0f);
+                auto * hdr1   = ggml_fill(ctx0, ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 1), float(n_draft));
+                auto * row0   = ggml_concat(ctx0, ggml_concat(ctx0, hdr0, hdr1, 0), ggml_cast(ctx0, ids_vec, GGML_TYPE_F32), 0);
+                auto * packed = ggml_pad(ctx0, row0, n_embd - (2 + n_draft), block - 1, 0, 0);
+                res->t_h_nextn = packed;
+                res->t_logits  = nullptr;
+                ggml_build_forward_expand(gf, packed);
+                return;
+            }
+        }
+    }
+
     auto * base = build_lora_mm(target->output, cur, target->output_s);
     ggml_prec_set_acc(base, GGML_PREC_F32);
     if (model.dspark_markov_w2 && base->ne[0] > hparams.n_vocab_unpadded) {
@@ -316,7 +555,6 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
             mark_add = reinterpret_cast<inkling_mark_add>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_mark_inkling_vocab_add"));
         }
     }
-    const int64_t head_rows = prefix_rows ? prefix_rows : block;
     for (int64_t i = 1; i < head_rows; ++i) {
         auto * col = build_inkling2_head(*this, model, *target, prev, state, column(cur, i), column(base, i), context, mark_add);
         logits = ggml_concat(ctx0, logits, col, 1);

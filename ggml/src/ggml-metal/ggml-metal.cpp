@@ -338,9 +338,12 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
             } break;
         case GGML_OP_CUSTOM:
             {
-                if (tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_FLASH_ATTN &&
+                const int32_t tag = tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+                if (tag == GGML_METAL_INKLING_FLASH_ATTN &&
                         tensor->src[0] && tensor->src[0]->ne[2] < 16) {
                     res = GGML_PAD(res, 64) + (size_t)32 * 24 * (size_t)tensor->src[0]->ne[2] * 130 * sizeof(float);
+                } else if (tag == GGML_METAL_INKLING_DSPARK_ARGMAX) {
+                    res = GGML_PAD(res, 16) + 256 * 2 * sizeof(uint32_t);
                 }
             } break;
         default:
@@ -1178,6 +1181,30 @@ static ggml_tensor * ggml_backend_metal_inkling_ctrl_apply_v1(ggml_context * ctx
     return node;
 }
 
+static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v1(ggml_context * ctx,
+        ggml_tensor * w2, ggml_tensor * w2_b, ggml_tensor * base_row,
+        ggml_tensor * latent, ggml_tensor * shortlist_ids) {
+    if (!w2 || !w2_b || !base_row || !latent ||
+            (w2->type != GGML_TYPE_Q8_0 && w2->type != GGML_TYPE_BF16) ||
+            !ggml_is_contiguous(w2) || w2->ne[2] != 1 || w2->ne[3] != 1 ||
+            w2->ne[0] <= 0 || w2->ne[0] > 512 || w2->ne[0] % 32 != 0 || w2->ne[1] <= 0 ||
+            w2->nb[1] != ggml_row_size(w2->type, w2->ne[0]) ||
+            w2_b->type != GGML_TYPE_F32 || !ggml_is_contiguous(w2_b) || ggml_nelements(w2_b) != w2->ne[1] ||
+            base_row->type != GGML_TYPE_F32 || !ggml_is_contiguous(base_row) || ggml_nelements(base_row) != w2->ne[1] ||
+            latent->type != GGML_TYPE_F32 || !ggml_is_contiguous(latent) || ggml_nelements(latent) != w2->ne[0]) {
+        return nullptr;
+    }
+    if (shortlist_ids && (shortlist_ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(shortlist_ids) ||
+            ggml_nelements(shortlist_ids) != w2->ne[1])) {
+        return nullptr;
+    }
+    ggml_tensor * args[] = {w2, w2_b, base_row, latent, shortlist_ids};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, shortlist_ids ? 5 : 4,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling DSpark argmax requires Metal"); }, 1, nullptr);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_DSPARK_ARGMAX;
+    return node;
+}
+
 static ggml_tensor * ggml_backend_metal_inkling_situ_v1(ggml_context * ctx, ggml_tensor * gate_up,
         float beta, float linear_beta) {
     if (gate_up->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate_up) ||
@@ -1413,6 +1440,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_ctrl_apply_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_ctrl_apply_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_dspark_argmax_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_situ_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_situ_v1;

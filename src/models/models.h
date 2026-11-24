@@ -1612,6 +1612,20 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_mistral_large4();
     void load_tensors_inkling2();
 
+    struct inkling_dspark_fast_head {
+        const llama_model * target = nullptr;
+        int64_t n_vocab = 0;
+        bool    w2_q8   = false;
+        ggml_context_ptr        ctx;
+        ggml_backend_buffer_ptr buf;
+        ggml_tensor * output_short  = nullptr;
+        ggml_tensor * w2_fast       = nullptr;
+        ggml_tensor * w2_b_fast     = nullptr;
+        ggml_tensor * shortlist_ids = nullptr;
+    };
+    mutable std::mutex inkling_head_mtx;
+    mutable inkling_dspark_fast_head inkling_head;
+
     template <bool is_enc>
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);

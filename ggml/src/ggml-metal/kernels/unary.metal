@@ -283,6 +283,170 @@ kernel void kernel_inkling_ctrl_apply_q8_0(
     dst[idx] = (x - forgotten) + gained;
 }
 
+// Fused single-pass Inkling DSpark Markov head + strict first-maximum argmax.
+// Replaces w2*latent + w2_b + base + softcap + 6-pass tie-break + CPU logit readback.
+struct inkling_dspark_part {
+    float val;
+    uint  idx;
+};
+
+struct inkling_dspark_argmax_args {
+    uint rank;
+    uint vocab;
+    uint has_shortlist;
+};
+
+inline bool inkling_dspark_better(float val_a, uint idx_a, float val_b, uint idx_b) {
+    if (idx_a == 0xFFFFFFFFu) { return false; }
+    if (idx_b == 0xFFFFFFFFu) { return true; }
+    return (val_a > val_b) || (val_a == val_b && idx_a < idx_b);
+}
+
+kernel void kernel_inkling_dspark_argmax_s1_q8_0(
+        constant inkling_dspark_argmax_args & args [[buffer(0)]],
+        device const inkling_block_q8_0 * w2       [[buffer(1)]],
+        device const float * w2_b                  [[buffer(2)]],
+        device const float * base_row              [[buffer(3)]],
+        device const float * latent                [[buffer(4)]],
+        device inkling_dspark_part * parts         [[buffer(5)]],
+        uint   group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh_lat[512];
+    for (uint k = tid; k < args.rank; k += 256u) {
+        sh_lat[k] = latent[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint nb = args.rank / 32u;
+    const uint g_blk = lane / 4u;
+    const uint p = (lane % 4u) * 8u;
+
+    float best_val = -INFINITY;
+    uint  best_idx = 0xFFFFFFFFu;
+
+    for (uint v = group * 8u + sg; v < args.vocab; v += 2048u) {
+        device const inkling_block_q8_0 * w_row = w2 + ulong(v) * nb;
+        float acc = 0.0f;
+        for (uint ib = g_blk; ib < nb; ib += 8u) {
+            const device inkling_block_q8_0 & b = w_row[ib];
+            const uint k0 = ib * 32u + p;
+            const float4 l0 = float4(sh_lat[k0 + 0], sh_lat[k0 + 1], sh_lat[k0 + 2], sh_lat[k0 + 3]);
+            const float4 l1 = float4(sh_lat[k0 + 4], sh_lat[k0 + 5], sh_lat[k0 + 6], sh_lat[k0 + 7]);
+            const float4 q0 = float4(b.qs[p + 0], b.qs[p + 1], b.qs[p + 2], b.qs[p + 3]);
+            const float4 q1 = float4(b.qs[p + 4], b.qs[p + 5], b.qs[p + 6], b.qs[p + 7]);
+            acc = fma(float(b.d), dot(q0, l0) + dot(q1, l1), acc);
+        }
+        const float d = simd_sum(acc);
+        if (lane == 0) {
+            const float s = d + w2_b[v] + base_row[v];
+            if (!isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
+                best_val = s;
+                best_idx = v;
+            }
+        }
+    }
+
+    threadgroup inkling_dspark_part sh_sg[8];
+    if (lane == 0) {
+        sh_sg[sg] = { best_val, best_idx };
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        inkling_dspark_part win = sh_sg[0];
+        for (uint j = 1u; j < 8u; ++j) {
+            if (inkling_dspark_better(sh_sg[j].val, sh_sg[j].idx, win.val, win.idx)) {
+                win = sh_sg[j];
+            }
+        }
+        parts[group] = win;
+    }
+}
+
+#if defined(GGML_METAL_HAS_BF16)
+kernel void kernel_inkling_dspark_argmax_s1_bf16(
+        constant inkling_dspark_argmax_args & args [[buffer(0)]],
+        device const bfloat4 * w2                  [[buffer(1)]],
+        device const float * w2_b                  [[buffer(2)]],
+        device const float * base_row              [[buffer(3)]],
+        device const float * latent                [[buffer(4)]],
+        device inkling_dspark_part * parts         [[buffer(5)]],
+        uint   group [[threadgroup_position_in_grid]],
+        ushort tid   [[thread_index_in_threadgroup]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float sh_lat[512];
+    for (uint k = tid; k < args.rank; k += 256u) {
+        sh_lat[k] = latent[k];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint r4 = args.rank / 4u;
+    float best_val = -INFINITY;
+    uint  best_idx = 0xFFFFFFFFu;
+
+    for (uint v = group * 8u + sg; v < args.vocab; v += 2048u) {
+        device const bfloat4 * w_row = w2 + ulong(v) * r4;
+        float acc = 0.0f;
+        for (uint i = lane; i < r4; i += 32u) {
+            const float4 wv = float4(w_row[i]);
+            const uint k0 = i * 4u;
+            const float4 lv = float4(sh_lat[k0 + 0], sh_lat[k0 + 1], sh_lat[k0 + 2], sh_lat[k0 + 3]);
+            acc += dot(wv, lv);
+        }
+        const float d = simd_sum(acc);
+        if (lane == 0) {
+            const float s = d + w2_b[v] + base_row[v];
+            if (!isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
+                best_val = s;
+                best_idx = v;
+            }
+        }
+    }
+
+    threadgroup inkling_dspark_part sh_sg[8];
+    if (lane == 0) {
+        sh_sg[sg] = { best_val, best_idx };
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0) {
+        inkling_dspark_part win = sh_sg[0];
+        for (uint j = 1u; j < 8u; ++j) {
+            if (inkling_dspark_better(sh_sg[j].val, sh_sg[j].idx, win.val, win.idx)) {
+                win = sh_sg[j];
+            }
+        }
+        parts[group] = win;
+    }
+}
+#endif
+
+kernel void kernel_inkling_dspark_argmax_s2(
+        constant inkling_dspark_argmax_args & args [[buffer(0)]],
+        device const inkling_dspark_part * parts   [[buffer(1)]],
+        device const int * shortlist_ids           [[buffer(2)]],
+        device       int * dst                     [[buffer(3)]],
+        ushort tid [[thread_index_in_threadgroup]]) {
+    threadgroup inkling_dspark_part sh[256];
+    sh[tid] = parts[tid];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            if (inkling_dspark_better(sh[tid + stride].val, sh[tid + stride].idx, sh[tid].val, sh[tid].idx)) {
+                sh[tid] = sh[tid + stride];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid == 0) {
+        const uint local_idx = (sh[0].idx < args.vocab) ? sh[0].idx : 0u;
+        dst[0] = args.has_shortlist ? shortlist_ids[local_idx] : int(local_idx);
+    }
+}
+
 constant short FC_unary_op [[function_constant(FC_UNARY + 0)]];
 constant bool  FC_unary_cnt[[function_constant(FC_UNARY + 1)]];
 
