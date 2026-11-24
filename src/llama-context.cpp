@@ -249,6 +249,7 @@ llama_context::llama_context(
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
     cparams.embeddings_layer_inp_dev = false;
     cparams.embeddings_nextn_dev     = false;
+    cparams.dspark_fast_argmax       = false;
     cparams.ctx_state_src            = nullptr;
     embd_layer_inp.resize(hparams.n_layer() + 1);
 
@@ -1865,6 +1866,25 @@ void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
 }
 
+void llama_context::set_dspark_fast_argmax(bool value) {
+    if (cparams.dspark_fast_argmax != value) {
+        cparams.dspark_fast_argmax = value;
+        sched_need_reserve = true;
+    }
+}
+
+int32_t llama_context::get_draft_ids(llama_token * out, int32_t max_n) {
+    if (!has_draft_ids) {
+        return -1;
+    }
+    synchronize();
+    const int32_t n = std::min<int32_t>((int32_t) draft_ids.size(), std::max<int32_t>(0, max_n));
+    if (out && n > 0) {
+        std::memcpy(out, draft_ids.data(), (size_t) n * sizeof(llama_token));
+    }
+    return n;
+}
+
 void llama_context::set_causal_attn(bool value) {
     LLAMA_LOG_DEBUG("%s: value = %d\n", __func__, value);
 
@@ -2136,10 +2156,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
-    if (!embd_seq.empty()) {
+    if (!embd_seq.empty() || has_draft_ids) {
         synchronize();
     }
     embd_seq.clear();
+    has_draft_ids = false;
+    draft_ids.clear();
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -2483,10 +2505,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
 
     // TODO: this clear of the buffer can easily be forgotten - need something better
     // sync first so any in-flight async copies into embd_seq complete before it is freed
-    if (!embd_seq.empty()) {
+    if (!embd_seq.empty() || has_draft_ids) {
         synchronize();
     }
     embd_seq.clear();
+    has_draft_ids = false;
+    draft_ids.clear();
 
     if (t_compute_start_us == 0) {
         t_compute_start_us = ggml_time_us();
@@ -2904,6 +2928,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 extract_all_idxs = extract_all_idxs || !masked;
             }
+        }
+
+        // extract typed GPU-selected draft token IDs when produced by the graph
+        if (auto * t_draft_ids = res->get_draft_ids()) {
+            GGML_ASSERT(t_draft_ids->type == GGML_TYPE_I32);
+            ggml_backend_t backend_draft = ggml_backend_sched_get_tensor_backend(sched.get(), t_draft_ids);
+            GGML_ASSERT(backend_draft != nullptr);
+            const int64_t n_draft = ggml_nelements(t_draft_ids);
+            draft_ids.resize((size_t) n_draft);
+            if (n_draft > 0) {
+                ggml_backend_tensor_get_async(backend_draft, t_draft_ids, draft_ids.data(), 0, (size_t) n_draft * sizeof(llama_token));
+            }
+            has_draft_ids = true;
         }
 
         if (extract_all_idxs) {
@@ -5206,6 +5243,14 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_set_dspark_fast_argmax(llama_context * ctx, bool value) {
+    ctx->set_dspark_fast_argmax(value);
+}
+
+int32_t llama_get_draft_ids(llama_context * ctx, llama_token * out, int32_t max_n) {
+    return ctx->get_draft_ids(out, max_n);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

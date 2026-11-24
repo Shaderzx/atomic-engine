@@ -141,6 +141,9 @@ struct llama_context {
     bool set_ctx_state_src(llama_context * ctx_src);
     bool supports_state_row() const;
     void set_nextn_layer_offset(int32_t offset);
+
+    void    set_dspark_fast_argmax(bool value);
+    int32_t get_draft_ids(llama_token * out, int32_t max_n);
     void set_causal_attn(bool value);
 
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -397,6 +400,10 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // typed GPU-selected draft token IDs from the most recent decode (reset before every decode)
+    std::vector<llama_token> draft_ids;
+    bool has_draft_ids = false;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

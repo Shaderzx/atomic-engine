@@ -763,14 +763,20 @@ kernel void kernel_inkling_fa_decode_impl(
     float  sink_r[SLOTS];
     float  far_r[SLOTS];
     int    qpos_r[BQ];
+    ulong  qbit_r[BQ];
     int    min_qp = INT_MAX;
     int    max_qp = INT_MIN;
+    ulong  tg_seq_mask = 0ULL;
 
     FOR_UNROLL (int qi = 0; qi < BQ; ++qi) {
         const uint q_idx = q0 + qi;
         if (q_idx < args.n_q) {
-            const int qp = q_pos[q_idx];
+            const int qp = q_pos[q_idx * 2u];
+            const uint qseq = (uint)q_pos[q_idx * 2u + 1u];
+            const ulong qbit = qseq < 64u ? (1ULL << qseq) : 0ULL;
             qpos_r[qi] = qp;
+            qbit_r[qi] = qbit;
+            tg_seq_mask |= qbit;
             min_qp = min(min_qp, qp);
             max_qp = max(max_qp, qp);
             FOR_UNROLL (int g = 0; g < 3; ++g) {
@@ -788,6 +794,7 @@ kernel void kernel_inkling_fa_decode_impl(
             }
         } else {
             qpos_r[qi] = -1;
+            qbit_r[qi] = 0ULL;
             FOR_UNROLL (int g = 0; g < 3; ++g) {
                 const int slot = qi * 3 + g;
                 q_reg[slot] = 0.0h;
@@ -802,8 +809,10 @@ kernel void kernel_inkling_fa_decode_impl(
 
     const uint step = nwg * (uint)NSG;
     for (uint ik = iwg * (uint)NSG + sg; ik < args.n_kv; ik += step) {
-        const int kp = k_pos[ik];
-        if (kp < 0 || kp > max_qp || (n_swa > 0 && kp <= min_qp - n_swa)) {
+        const uint kbase = ik * 3u;
+        const int kp = k_pos[kbase];
+        const ulong kmask = ulong(uint(k_pos[kbase + 1u])) | (ulong(uint(k_pos[kbase + 2u])) << 32);
+        if (kp < 0 || (kmask & tg_seq_mask) == 0ULL || kp > max_qp || (n_swa > 0 && kp <= min_qp - n_swa)) {
             continue;
         }
         const float4 k4 = inkling_load_kv4<KV_KIND>(k, ik, kv_head, args.nb11, args.nb12, lane);
@@ -811,7 +820,7 @@ kernel void kernel_inkling_fa_decode_impl(
 
         FOR_UNROLL (int qi = 0; qi < BQ; ++qi) {
             const uint q_idx = q0 + qi;
-            if (q_idx >= args.n_q) { continue; }
+            if (q_idx >= args.n_q || (kmask & qbit_r[qi]) == 0ULL) { continue; }
             const int d = qpos_r[qi] - kp;
             if (d < 0 || (n_swa > 0 && d >= n_swa)) { continue; }
             const bool is_far = (uint)d >= extent;
@@ -840,6 +849,9 @@ kernel void kernel_inkling_fa_decode_impl(
     threadgroup float4 sh_o[NSG * 32];
     threadgroup float  sh_m[NSG];
     threadgroup float  sh_s[NSG];
+
+    // Stride 132 floats (528 B) keeps every split-K partition 16-byte aligned for float4.
+    constexpr uint SPLIT_STRIDE = 132u;
 
     FOR_UNROLL (int qi = 0; qi < BQ; ++qi) {
         const uint q_idx = q0 + qi;
@@ -877,7 +889,7 @@ kernel void kernel_inkling_fa_decode_impl(
                     const float inv = denom == 0.0f ? 0.0f : corr / denom;
                     ((device float4 *)(dst + ((uint64_t)q_idx * 24u + head) * 128u))[lane] = o_all * inv;
                 } else {
-                    device float * out_part = tmp + (((uint64_t)q_idx * 24u + head) * nwg + iwg) * 130u;
+                    device float * out_part = tmp + (((uint64_t)q_idx * 24u + head) * nwg + iwg) * SPLIT_STRIDE;
                     ((device float4 *)out_part)[lane] = o_all;
                     if (lane == 0) {
                         out_part[128] = m_all;
@@ -896,28 +908,29 @@ kernel void kernel_inkling_fa_decode_reduce(
         device       float * dst [[buffer(2)]],
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort lane  [[thread_index_in_simdgroup]]) {
+    constexpr uint SPLIT_STRIDE = 132u;
     const uint q_idx = tgpig.x;
     const uint head  = tgpig.y;
     const uint nwg   = dims.y;
-    device const float * base = tmp + ((uint64_t)q_idx * 24u + head) * nwg * 130u;
+    device const float * base = tmp + ((uint64_t)q_idx * 24u + head) * nwg * SPLIT_STRIDE;
 
     float m_all = -FLT_MAX / 2.0f;
     for (uint w = 0; w < nwg; ++w) {
-        const float sw = base[w * 130u + 129u];
+        const float sw = base[w * SPLIT_STRIDE + 129u];
         if (sw > 0.0f) {
-            m_all = max(m_all, base[w * 130u + 128u]);
+            m_all = max(m_all, base[w * SPLIT_STRIDE + 128u]);
         }
     }
 
     float s_all = 0.0f;
     float4 o_all = 0.0f;
     for (uint w = 0; w < nwg; ++w) {
-        const float sw = base[w * 130u + 129u];
+        const float sw = base[w * SPLIT_STRIDE + 129u];
         if (sw > 0.0f) {
-            const float mw = base[w * 130u + 128u];
+            const float mw = base[w * SPLIT_STRIDE + 128u];
             const float wt = exp(mw - m_all);
             s_all += sw * wt;
-            o_all += ((device const float4 *)(base + w * 130u))[lane] * wt;
+            o_all += ((device const float4 *)(base + w * SPLIT_STRIDE))[lane] * wt;
         }
     }
 

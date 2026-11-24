@@ -30,3 +30,8 @@ target_include_directories(test-memory-policy PRIVATE ${PROJECT_SOURCE_DIR}/incl
 
 llama_build_and_test(test-prefill-window-scheduler.cpp LINK ggml Threads::Threads)
 set_tests_properties(test-prefill-window-scheduler PROPERTIES TIMEOUT 30)
+
+if (GGML_METAL)
+    llama_build_and_test(test-inkling-metal.cpp LINK ggml ggml-metal Threads::Threads)
+    set_tests_properties(test-inkling-metal PROPERTIES TIMEOUT 60)
+endif()

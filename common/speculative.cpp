@@ -1446,6 +1446,13 @@ struct common_speculative_impl_draft_dspark final : public common_speculative_im
             const size_t slots = (size_t) n_seq * context_rows;
             context_embd.resize(slots * (size_t) n_embd_dec);
             context_pos.assign(slots, -1);
+
+            const bool use_fast_argmax = n_seq == 1 && this->params.p_min <= 0.0f && !this->params.probabilistic;
+            llama_set_dspark_fast_argmax(this->params.ctx_dft, use_fast_argmax);
+            if (!use_fast_argmax) {
+                LOG_INF("%s: Inkling DSpark fast GPU argmax disabled (n_seq=%u, p_min=%.3f, probabilistic=%d)\n",
+                        __func__, n_seq, this->params.p_min, (int) this->params.probabilistic);
+            }
         }
 
         LOG_INF("%s: - sample_from_anchor=%s\n", __func__, sample_from_anchor ? "true" : "false");
@@ -1582,6 +1589,15 @@ protected:
 
 public:
 
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        common_speculative_impl_draft_dflash::begin(seq_id, prompt);
+        if (use_prompt_lookup && !lookup_table.empty()) {
+            std::memset(lookup_table.data(), 0, lookup_table.size() * sizeof(lookup_bucket));
+            lookup_indexed = 0;
+            lookup_tok0 = lookup_tok_mid = lookup_tok_end = LLAMA_TOKEN_NULL;
+        }
+    }
+
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
@@ -1648,15 +1664,20 @@ public:
 
             auto & result = *dp.result;
 
-            // Inkling2 fast GPU argmax path packs the predicted token IDs directly into h_nextn
-            // with sentinel -1337.0f, avoiding 200K-vocab logit readback and host sampling.
+            // Inkling2 opt-in GPU argmax path exposes exact int32 token IDs via llama_get_draft_ids(),
+            // avoiding 200K-vocab logit readback and host sampling.
             if (has_rnn_context && n_seq == 1) {
-                const float * fast_ids = llama_get_embeddings_nextn(ctx_dft);
-                if (fast_ids && fast_ids[0] == -1337.0f) {
-                    const int32_t n_packed = (int32_t) std::lrintf(fast_ids[1]);
-                    const int32_t n_take = std::min(params.n_max, n_packed);
+                std::vector<llama_token> fast_ids((size_t) std::max<int32_t>(0, params.n_max));
+                const int32_t n_fast = llama_get_draft_ids(ctx_dft, fast_ids.data(), params.n_max);
+                if (n_fast >= 0) {
+                    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
+                    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                    const int32_t n_take = std::min(params.n_max, n_fast);
                     for (int32_t k = 0; k < n_take; ++k) {
-                        const llama_token id = (llama_token) std::lrintf(fast_ids[2 + k]);
+                        const llama_token id = fast_ids[(size_t) k];
+                        if (id < 0 || id >= n_vocab) {
+                            break;
+                        }
                         result.push_back(id);
                     }
                     if (result.size() < (size_t) params.n_min) {

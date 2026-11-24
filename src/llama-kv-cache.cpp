@@ -2023,13 +2023,32 @@ void llama_kv_cache::set_input_relative_pos(ggml_tensor * dst, const llama_ubatc
 
 void llama_kv_cache::set_input_k_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(dst->type == GGML_TYPE_I32);
-    GGML_ASSERT(ubatch->n_seqs == 1);
-    const int64_t n_kv = dst->ne[0];
-    const llama_seq_id seq_id = ubatch->seq_id[0][0];
-    const auto & cells = v_cells.at(seq_to_stream.at(seq_id));
-    std::vector<int32_t> data(n_kv);
+    GGML_ASSERT(dst->ne[0] == 3);
+    const int64_t n_kv = dst->ne[1];
+    GGML_ASSERT(ubatch->n_tokens > 0);
+    const uint32_t strm0 = seq_to_stream.at(ubatch->seq_id[0][0]);
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        GGML_ASSERT(ubatch->n_seq_id[i] == 1);
+        GGML_ASSERT(seq_to_stream.at(ubatch->seq_id[i][0]) == strm0);
+    }
+    const auto & cells = v_cells.at(strm0);
+    const uint32_t max_seq = std::min<uint32_t>(n_seq_max, 64u);
+    std::vector<int32_t> data((size_t) n_kv * 3u, 0);
     for (int64_t j = 0; j < n_kv; ++j) {
-        data[j] = (cells.is_empty(j) || !cells.seq_has(j, seq_id)) ? -1 : cells.pos_get(j);
+        if (cells.is_empty(j)) {
+            data[(size_t) j * 3u + 0u] = -1;
+            continue;
+        }
+        data[(size_t) j * 3u + 0u] = cells.pos_get(j);
+        const auto & sset = cells.seq_get_all(j);
+        uint64_t mask = 0;
+        for (uint32_t s = 0; s < max_seq; ++s) {
+            if (sset.test(s)) {
+                mask |= (1ULL << s);
+            }
+        }
+        data[(size_t) j * 3u + 1u] = (int32_t) (uint32_t) (mask & 0xFFFFFFFFULL);
+        data[(size_t) j * 3u + 2u] = (int32_t) (uint32_t) (mask >> 32);
     }
     ggml_backend_tensor_set(dst, data.data(), 0, ggml_nbytes(dst));
 }

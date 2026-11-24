@@ -384,13 +384,16 @@ kernel void kernel_inkling_fa_tensor_impl(
     const uint extent    = args.extent;
     const int  n_swa     = (int)args.n_swa;
 
+    // Layout must stay in sync with ggml_metal_inkling_fa_tensor_smem() in ggml-metal-expert.h.
+    // Every region starts on a 16-byte boundary (Q in {16, 32}, DK=128, C=64).
     threadgroup half  * sq      = (threadgroup half  *) shmem;             // [Q, 128]
     threadgroup float * ss      = (threadgroup float *) (sq + Q * DK);     // [Q, 64]
     threadgroup half  * sp      = (threadgroup half  *) (ss + Q * C);      // [Q, 64]
     threadgroup float * sr      = (threadgroup float *) (sp + Q * C);      // [Q]
     threadgroup int   * sf      = (threadgroup int   *) (sr + Q);          // [4]
     threadgroup int   * kpos_tg = (threadgroup int   *) (sf + 4);          // [64]
-    threadgroup half  * skv     = (threadgroup half  *) (kpos_tg + C);     // [64, 128] (KV_KIND != 0)
+    threadgroup ulong * kseq_tg = (threadgroup ulong *) (kpos_tg + C);     // [64]
+    threadgroup half  * skv     = (threadgroup half  *) (kseq_tg + C);     // [64, 128] (KV_KIND != 0)
 
     for (uint i = tiitg; i < (uint)(Q * DK / 4); i += NT) {
         const uint j = i / (DK / 4);
@@ -403,19 +406,25 @@ kernel void kernel_inkling_fa_tensor_impl(
     }
 
     int   qpos_r[NQ];
+    ulong qbit_r[NQ];
     float sink_r[NQ];
     float far_bias_r[NQ];
     float M[NQ];
     float S[NQ];
-    int my_min_qp = INT_MAX;
-    int my_max_qp = INT_MIN;
+    int   my_min_qp = INT_MAX;
+    int   my_max_qp = INT_MIN;
+    ulong my_seq_mask = 0ULL;
 
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const uint j = (uint)(jj * NSG + sgitg);
         const uint q_idx = iq1 + j;
         if (q_idx < args.n_q) {
-            const int qp = q_pos[q_idx];
+            const int qp = q_pos[q_idx * 2u];
+            const uint qseq = (uint)q_pos[q_idx * 2u + 1u];
+            const ulong qbit = qseq < 64u ? (1ULL << qseq) : 0ULL;
             qpos_r[jj] = qp;
+            qbit_r[jj] = qbit;
+            my_seq_mask |= qbit;
             my_min_qp = min(my_min_qp, qp);
             my_max_qp = max(my_max_qp, qp);
             const uint qh = q_idx * 24u + head;
@@ -424,6 +433,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             far_bias_r[jj] = -sk_val;
         } else {
             qpos_r[jj] = -1;
+            qbit_r[jj] = 0ULL;
             sink_r[jj] = 0.0f;
             far_bias_r[jj] = 0.0f;
         }
@@ -434,11 +444,14 @@ kernel void kernel_inkling_fa_tensor_impl(
     if (tiisg == 0) {
         kpos_tg[sgitg]     = my_min_qp;
         kpos_tg[sgitg + 4] = my_max_qp;
+        kseq_tg[sgitg]     = my_seq_mask;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    const int tg_min_qp = min(min(kpos_tg[0], kpos_tg[1]), min(kpos_tg[2], kpos_tg[3]));
-    const int tg_max_qp = max(max(kpos_tg[4], kpos_tg[5]), max(kpos_tg[6], kpos_tg[7]));
+    const int   tg_min_qp     = min(min(kpos_tg[0], kpos_tg[1]), min(kpos_tg[2], kpos_tg[3]));
+    const int   tg_max_qp     = max(max(kpos_tg[4], kpos_tg[5]), max(kpos_tg[6], kpos_tg[7]));
+    const ulong tg_seq_mask   = kseq_tg[0] | kseq_tg[1] | kseq_tg[2] | kseq_tg[3];
+    const bool  tg_single_seq = (tg_seq_mask != 0ULL) && ((tg_seq_mask & (tg_seq_mask - 1ULL)) == 0ULL);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -471,10 +484,14 @@ kernel void kernel_inkling_fa_tensor_impl(
 
     for (uint ic0 = 0, ic = 0; ic < args.n_kv; ++ic0, ic += C) {
         if (tiitg < 64u) {
-            const int kp = k_pos[ic + tiitg];
+            const uint kbase = (ic + tiitg) * 3u;
+            const int kp = k_pos[kbase];
+            const ulong kmask = ulong(uint(k_pos[kbase + 1u])) | (ulong(uint(k_pos[kbase + 2u])) << 32);
             kpos_tg[tiitg] = kp;
-            const bool vis = (kp >= 0) && (kp <= tg_max_qp) && (n_swa == 0 || kp > tg_min_qp - n_swa);
-            const bool far_ok = (n_swa == 0) && (kp >= 0) && (kp <= tg_min_qp - (int)extent);
+            kseq_tg[tiitg] = kmask;
+            const bool seq_hit = (kmask & tg_seq_mask) != 0ULL;
+            const bool vis = (kp >= 0) && seq_hit && (kp <= tg_max_qp) && (n_swa == 0 || kp > tg_min_qp - n_swa);
+            const bool far_ok = (n_swa == 0) && tg_single_seq && (kp >= 0) && seq_hit && (kp <= tg_min_qp - (int)extent);
             const bool sg_any_vis = simd_any(vis);
             const bool sg_all_far = simd_all(far_ok);
             if (tiisg == 0) {
@@ -529,13 +546,14 @@ kernel void kernel_inkling_fa_tensor_impl(
                 }
             } else {
                 const int qp = qpos_r[jj];
+                const ulong qbit = qbit_r[jj];
                 const float sk_val = sink_r[jj];
                 const uint64_t tbl_off = (uint64_t)(q_idx * 24u + head) * extent;
                 FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
                     const uint col = ii * NW + tiisg;
                     const int kp = kpos_tg[col];
                     const int d = qp - kp;
-                    if (kp < 0 || d < 0 || (n_swa > 0 && d >= n_swa)) {
+                    if (kp < 0 || (kseq_tg[col] & qbit) == 0ULL || d < 0 || (n_swa > 0 && d >= n_swa)) {
                         s[ii] = -INFINITY;
                     } else {
                         const float rel = (uint)d < extent ? table[tbl_off + (uint)d] : 0.0f;

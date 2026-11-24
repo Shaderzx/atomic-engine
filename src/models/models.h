@@ -1612,10 +1612,13 @@ struct llama_model_dflash : public llama_model_base {
     void load_tensors_layers_mistral_large4();
     void load_tensors_inkling2();
 
-    struct inkling_dspark_fast_head {
-        const llama_model * target = nullptr;
-        int64_t n_vocab = 0;
-        bool    w2_q8   = false;
+    struct inkling_dspark_fast_head_entry {
+        const void * target_output_data = nullptr;
+        int64_t target_ne0  = 0;
+        int64_t target_ne1  = 0;
+        int64_t req_vocab   = 0;
+        int64_t eff_vocab   = 0;
+        bool    w2_q8       = false;
         ggml_context_ptr        ctx;
         ggml_backend_buffer_ptr buf;
         ggml_tensor * output_short  = nullptr;
@@ -1624,7 +1627,7 @@ struct llama_model_dflash : public llama_model_base {
         ggml_tensor * shortlist_ids = nullptr;
     };
     mutable std::mutex inkling_head_mtx;
-    mutable inkling_dspark_fast_head inkling_head;
+    mutable std::vector<std::shared_ptr<const inkling_dspark_fast_head_entry>> inkling_head_cache;
 
     template <bool is_enc>
     struct graph : public llm_graph_context {
@@ -2529,7 +2532,8 @@ struct llama_model_inkling2 : public llama_model_base {
 
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
-        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query);
+        ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
+                bool * out_fused = nullptr);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2548,9 +2552,9 @@ struct llama_model_inkling2 : public llama_model_base {
 
         // the inputs and the token embeddings
         ggml_tensor * build_inputs();
-        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] are mixed into its inputs
+        // cache slot il of physical layer ip; messages [n_embd, LOOP_CTRL_COUNT, n_tokens] (or [n_embd, n_tokens, LOOP_CTRL_COUNT] when messages_fused)
         ggml_tensor * build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr);
+                ggml_tensor * messages = nullptr, const loop_layer * loop = nullptr, bool messages_fused = false);
         void build_output(ggml_tensor * cur, const std::vector<ggml_tensor *> & blocks);
 
         llm_graph_input_mem_hybrid_iswa_rel * inp  = nullptr;

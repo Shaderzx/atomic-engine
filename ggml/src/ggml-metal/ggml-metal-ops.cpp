@@ -312,6 +312,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         if (!pipeline.pipeline) {
                             pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                         }
+                        GGML_ASSERT(pipeline.pipeline);
                         struct {
                             uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22;
                             float scale;
@@ -322,7 +323,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                             scale,
                         };
                         const uint32_t Q = kv_type == GGML_TYPE_F16 ? 32u : 16u;
-                        const size_t smem = kv_type == GGML_TYPE_F16 ? 21504u : 27648u;
+                        const size_t smem = ggml_metal_inkling_fa_tensor_smem(Q, kv_type != GGML_TYPE_F16);
                         ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                         ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
                         for (int i = 0; i < 7; ++i) {
@@ -333,7 +334,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + Q - 1) / Q, 24, 1, 32, 4, 1);
                     } else {
                         const uint32_t bq  = n_q == 1 ? 1u : 4u;
-                        const uint32_t nwg = n_kv <= 512u ? 1u : (n_kv <= 4096u ? 4u : (n_kv <= 32768u ? 16u : 32u));
+                        const uint32_t nwg = n_kv <= 512u ? 1u : (n_kv <= 4096u ? 4u : (n_kv <= 32768u ? 16u : GGML_METAL_INKLING_FA_SPLIT_MAX_NWG));
                         const char * kernel = nullptr;
                         if (kv_type == GGML_TYPE_F16)       { kernel = bq == 1 ? "kernel_inkling_fa_decode_f16_q1"  : "kernel_inkling_fa_decode_f16_q4"; }
                         else if (kv_type == GGML_TYPE_Q8_0) { kernel = bq == 1 ? "kernel_inkling_fa_decode_q8_0_q1" : "kernel_inkling_fa_decode_q8_0_q4"; }
@@ -342,6 +343,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         if (!pipeline.pipeline) {
                             pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                         }
+                        GGML_ASSERT(pipeline.pipeline);
                         struct {
                             uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22, nwg;
                             float scale;
@@ -370,6 +372,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                             if (!rpipe.pipeline) {
                                 rpipe = ggml_metal_library_compile_pipeline(ctx->lib, rkernel, rkernel, nullptr);
                             }
+                            GGML_ASSERT(rpipe.pipeline);
                             uint32_t rdims[2] = {n_q, nwg};
                             ggml_metal_encoder_set_pipeline(ctx->enc, rpipe);
                             ggml_metal_encoder_set_bytes(ctx->enc, rdims, sizeof(rdims), 0);
@@ -386,6 +389,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                     uint32_t dims[] = {uint32_t(node->src[1]->ne[2]), uint32_t(node->src[3]->ne[0]),
                             uint32_t(node->src[1]->nb[2]), uint32_t(node->src[2]->nb[2])};
@@ -405,8 +409,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     const int32_t n_states = node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
                     const int32_t n_q      = node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2];
+                    GGML_ASSERT(n_states >= 1 && n_states <= GGML_METAL_INKLING_MIX_MAX_STATES);
                     struct { uint32_t n_embd, n_tokens, n_states, n_q; float eps, scale; } args = {
                         uint32_t(node->ne[0]), uint32_t(node->ne[1]), uint32_t(n_states), uint32_t(n_q),
                         1e-6f, 1.0f / std::sqrt(float(node->ne[0]))
@@ -415,7 +421,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[n_states]), 1);
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 2);
-                    for (int k = 0; k < 9; ++k) {
+                    for (int k = 0; k < GGML_METAL_INKLING_MIX_MAX_STATES; ++k) {
                         ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(k < n_states ? node->src[k] : node->src[0]), 3 + k);
                     }
                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, node->ne[1], 1, 1, 256, 1, 1);
@@ -427,6 +433,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     struct { uint32_t n_embd, rank, n_tokens; float eps; } args = {
                         uint32_t(node->src[0]->ne[0]), uint32_t(node->ne[0]), uint32_t(node->ne[1]), 1e-6f
                     };
@@ -445,6 +452,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     struct { uint32_t n_embd, rank, n_tokens; float eps; } args = {
                         uint32_t(node->ne[0]), uint32_t(node->src[2]->ne[0]), uint32_t(node->ne[1]), 1e-6f
                     };
@@ -470,10 +478,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!p2.pipeline) { p2 = ggml_metal_library_compile_pipeline(ctx->lib, k2, k2, nullptr); }
                     GGML_ASSERT(p1.pipeline && p2.pipeline);
 
-                    struct { uint32_t rank, vocab, has_shortlist; } args = {
+                    const float cap = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
+                    struct { uint32_t rank, vocab, has_shortlist; float cap, inv_cap; } args = {
                         uint32_t(node->src[0]->ne[0]),
                         uint32_t(node->src[0]->ne[1]),
-                        uint32_t(node->src[4] != nullptr)
+                        uint32_t(node->src[4] != nullptr),
+                        cap,
+                        cap > 0.0f ? (1.0f / cap) : 0.0f
                     };
                     ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(node);
                     ggml_metal_buffer_id bid_parts = bid_dst;
@@ -504,6 +515,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     uint32_t n4 = (uint32_t)(ggml_nelements(node) / 4);
                     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[0]), 0);
@@ -519,6 +531,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     const float cap = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
                     struct { uint32_t n_in, n_out, n_rows; float cap, inv_cap; } args = {
                         uint32_t(node->src[0]->ne[0]), uint32_t(node->ne[0]), uint32_t(node->ne[1]),
@@ -537,6 +550,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     if (!pipeline.pipeline) {
                         pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
                     }
+                    GGML_ASSERT(pipeline.pipeline);
                     uint32_t n_elems = (uint32_t)ggml_nelements(node);
                     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                     for (int i = 0; i < 4; ++i) {

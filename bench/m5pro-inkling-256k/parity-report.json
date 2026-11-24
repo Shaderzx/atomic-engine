@@ -1,0 +1,107 @@
+{
+  "shader_validation_256k": {
+    "ok": true,
+    "startup_s": 1.84,
+    "long_prompt_tokens": 3143,
+    "short_completion_tokens": 96
+  },
+  "multi_slot_np2_256k": {
+    "ok": true,
+    "startup_s": 1.53,
+    "slot0_tokens": 96,
+    "slot1_tokens": 96,
+    "drop_to_1_answer": "391"
+  },
+  "parity": [
+    {
+      "name": "fused_on_vs_off_nospec_f16",
+      "prompts": 12,
+      "exact_text_match": "11/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "550/576 (95.5%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_vs_nospec_fused_f16",
+      "prompts": 12,
+      "exact_text_match": "11/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "550/576 (95.5%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_fused_vs_off_f16",
+      "prompts": 12,
+      "exact_text_match": "12/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "576/576 (100.0%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "fused_on_vs_off_nospec_q8_0",
+      "prompts": 12,
+      "exact_text_match": "9/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "531/576 (92.2%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_vs_nospec_fused_q8_0",
+      "prompts": 12,
+      "exact_text_match": "10/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "536/576 (93.1%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_fused_vs_off_q8_0",
+      "prompts": 12,
+      "exact_text_match": "10/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "542/576 (94.1%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "fused_on_vs_off_nospec_q4_0",
+      "prompts": 12,
+      "exact_text_match": "6/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "453/576 (78.6%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_vs_nospec_fused_q4_0",
+      "prompts": 12,
+      "exact_text_match": "8/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "507/576 (88.0%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    },
+    {
+      "name": "spec_fused_vs_off_q4_0",
+      "prompts": 12,
+      "exact_text_match": "6/12",
+      "first_token_match": "12/12",
+      "prefix_token_agreement": "440/576 (76.4%)",
+      "max_top1_logprob_diff": 0.0,
+      "med_top1_logprob_diff": 0.0
+    }
+  ],
+  "dspark_fast_vs_ref": {
+    "name": "dspark_fast_vs_ref_f16",
+    "prompts": 6,
+    "exact_text_match": "6/6",
+    "first_token_match": "6/6",
+    "prefix_token_agreement": "288/288 (100.0%)",
+    "max_top1_logprob_diff": 0.0,
+    "med_top1_logprob_diff": 0.0
+  }
+}

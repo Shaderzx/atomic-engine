@@ -184,17 +184,24 @@ ggml_tensor * llama_model_inkling2::graph::clip(ggml_tensor * cur, ggml_tensor *
 }
 
 // attention over the depth: mix the earlier block outputs and cur with learned queries
-ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query) {
-    if (inkling_dense_backend && mix_kernel && blocks.size() + 1 <= 9) {
-        ggml_tensor * st[9];
+ggml_tensor * llama_model_inkling2::graph::mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
+        bool * out_fused) {
+    if (out_fused) { *out_fused = false; }
+    // GGML_MAX_SRC is 10 and ggml_custom_4d requires n_args < GGML_MAX_SRC, so cap at 8 states + 1 query = 9.
+    constexpr size_t MAX_FUSED_MIX_STATES = 8;
+    if (inkling_dense_backend && mix_kernel && blocks.size() + 1 <= MAX_FUSED_MIX_STATES) {
+        ggml_tensor * st[MAX_FUSED_MIX_STATES];
         int n_st = 0;
         for (auto it = blocks.rbegin(); it != blocks.rend(); ++it) {
             st[n_st++] = *it;
         }
         st[n_st++] = cur;
         if (auto * fused = mix_kernel(ctx0, st, n_st, query)) {
-            ggml_backend_sched_set_tensor_backend(sched, fused, inkling_dense_backend);
-            return fused;
+            if (ggml_backend_supports_op(inkling_dense_backend, fused)) {
+                ggml_backend_sched_set_tensor_backend(sched, fused, inkling_dense_backend);
+                if (out_fused) { *out_fused = true; }
+                return fused;
+            }
         }
     }
     ggml_tensor * states = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens);
@@ -306,9 +313,17 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
             head_dims_match &= hparams.n_head(il) == 24 && hparams.n_head_kv(il) == 8 &&
                                hparams.n_embd_head_k(il) == 128 && hparams.n_embd_head_v(il) == 128;
         }
-        if (enabled && !expert_executor && !cparams.training &&
-                (cparams.kv_unified || cparams.n_seq_max == 1) &&
-                ubatch.n_seqs == 1 && ubatch.n_seqs_unq == 1 &&
+        bool seq_ids_ok = (cparams.kv_unified || cparams.n_seq_max == 1) &&
+                          cparams.n_seq_max <= 64 && ubatch.n_seqs <= 64;
+        if (seq_ids_ok && ubatch.n_seq_id && ubatch.seq_id) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] < 0 || ubatch.seq_id[i][0] >= 64) {
+                    seq_ids_ok = false;
+                    break;
+                }
+            }
+        }
+        if (enabled && !expert_executor && !cparams.training && seq_ids_ok &&
                 cparams.causal_attn && cparams.flash_attn && head_dims_match &&
                 attn_ctx && device && std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0 &&
                 model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all &&
@@ -332,6 +347,22 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
                     }
                     break;
                 }
+            }
+        }
+
+        // Fail fast instead of attempting a multi-tens-of-GiB dense kq_b allocation
+        // when fused Inkling FlashAttention cannot be used at long context.
+        if (!flash_create && attn_ctx) {
+            const int64_t n_kv_base = attn_ctx->get_base()->get_n_kv();
+            const int64_t kq_b_elem_bytes = (inkling_dense_backend && rel_mask_kernel) ? 2 : 4;
+            const int64_t est_dense_bytes = n_kv_base * n_tokens * (hparams.n_head(0) * kq_b_elem_bytes + 4);
+            constexpr int64_t MAX_SAFE_DENSE_KQ_B = 4LL << 30; // 4 GiB safety threshold
+            if (est_dense_bytes > MAX_SAFE_DENSE_KQ_B) {
+                LLAMA_LOG_ERROR("%s: dense Inkling kq_b fallback would require %.2f GiB (n_kv=%lld, n_tokens=%lld); "
+                        "long-context Inkling requires fused Metal FlashAttention (Metal 4 tensor ops, -fa on, "
+                        "unified KV or -np 1, -np <= 64, matching K/V dtypes in {f16, q8_0, q4_0})\n",
+                        __func__, est_dense_bytes / double(1LL << 30), (long long) n_kv_base, (long long) n_tokens);
+                throw std::runtime_error("Inkling dense relative-bias fallback exceeds safe memory limit; fused FlashAttention is required");
             }
         }
     }
@@ -362,7 +393,7 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
 }
 
 ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tensor * cur, std::vector<ggml_tensor *> & blocks,
-        ggml_tensor * messages, const loop_layer * loop) {
+        ggml_tensor * messages, const loop_layer * loop, bool messages_fused) {
     GGML_ASSERT(!messages == !loop);
 
     const auto & layer = model.layers[il];
@@ -375,7 +406,7 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
 
     // the message of controller ctrl, [n_embd, n_tokens]
     auto message = [&](int ctrl) {
-        if (messages->op == GGML_OP_CUSTOM) {
+        if (messages_fused) {
             return ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[1], ctrl*messages->nb[2]);
         }
         return ggml_cont(ctx0, ggml_view_2d(ctx0, messages, n_embd, n_tokens, messages->nb[2], ctrl*messages->nb[1]));
@@ -390,8 +421,9 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
     // attention inputs: SWA layers mix one, full-attention layers one each for Q, K and V
     ggml_tensor * inputs[3] = {cur, cur, cur};
     if (layer.attn_res_query) {
-        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query);
-        if (mixed->op == GGML_OP_CUSTOM) {
+        bool attn_mix_fused = false;
+        ggml_tensor * mixed = mix(blocks, cur, layer.attn_res_query, &attn_mix_fused);
+        if (attn_mix_fused) {
             if (is_swa) {
                 ggml_tensor * s = ggml_view_2d(ctx0, mixed, n_embd, n_tokens, mixed->nb[1], 0);
                 inputs[0] = inputs[1] = inputs[2] = s;

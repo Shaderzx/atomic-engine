@@ -59,19 +59,18 @@ kernel void kernel_inkling_mix(
         device const float4 * s5         [[buffer(8)]],
         device const float4 * s6         [[buffer(9)]],
         device const float4 * s7         [[buffer(10)]],
-        device const float4 * s8         [[buffer(11)]],
         uint   t     [[threadgroup_position_in_grid]],
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     if (t >= args.n_tokens) { return; }
-    device const float4 * st[9] = { s0, s1, s2, s3, s4, s5, s6, s7, s8 };
+    device const float4 * st[8] = { s0, s1, s2, s3, s4, s5, s6, s7 };
     const uint n4 = args.n_embd / 4u;
     const ulong row_off = ulong(t) * n4;
 
     threadgroup float sh_red[5][8];
-    threadgroup float sh_inv[9];
-    threadgroup float sh_w[4][9];
+    threadgroup float sh_inv[8];
+    threadgroup float sh_w[4][8];
 
     for (uint k = 0; k < args.n_states; ++k) {
         device const float4 * sk = st[k] + row_off;
@@ -291,10 +290,18 @@ struct inkling_dspark_part {
 };
 
 struct inkling_dspark_argmax_args {
-    uint rank;
-    uint vocab;
-    uint has_shortlist;
+    uint  rank;
+    uint  vocab;
+    uint  has_shortlist;
+    float cap;
+    float inv_cap;
 };
+
+// Bitwise IEEE-754 NaN test: immune to -ffast-math / finite-math-only folding.
+inline bool inkling_dspark_isnan(float v) {
+    const uint bits = as_type<uint>(v);
+    return ((bits & 0x7F800000u) == 0x7F800000u) && ((bits & 0x007FFFFFu) != 0u);
+}
 
 inline bool inkling_dspark_better(float val_a, uint idx_a, float val_b, uint idx_b) {
     if (idx_a == 0xFFFFFFFFu) { return false; }
@@ -340,10 +347,15 @@ kernel void kernel_inkling_dspark_argmax_s1_q8_0(
         }
         const float d = simd_sum(acc);
         if (lane == 0) {
-            const float s = d + w2_b[v] + base_row[v];
-            if (!isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
-                best_val = s;
-                best_idx = v;
+            float s = d + w2_b[v] + base_row[v];
+            if (!inkling_dspark_isnan(s)) {
+                if (args.cap > 0.0f) {
+                    s = args.cap * precise::tanh(s * args.inv_cap);
+                }
+                if (!inkling_dspark_isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
+                    best_val = s;
+                    best_idx = v;
+                }
             }
         }
     }
@@ -397,10 +409,15 @@ kernel void kernel_inkling_dspark_argmax_s1_bf16(
         }
         const float d = simd_sum(acc);
         if (lane == 0) {
-            const float s = d + w2_b[v] + base_row[v];
-            if (!isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
-                best_val = s;
-                best_idx = v;
+            float s = d + w2_b[v] + base_row[v];
+            if (!inkling_dspark_isnan(s)) {
+                if (args.cap > 0.0f) {
+                    s = args.cap * precise::tanh(s * args.inv_cap);
+                }
+                if (!inkling_dspark_isnan(s) && inkling_dspark_better(s, v, best_val, best_idx)) {
+                    best_val = s;
+                    best_idx = v;
+                }
             }
         }
     }
@@ -442,8 +459,12 @@ kernel void kernel_inkling_dspark_argmax_s2(
     }
 
     if (tid == 0) {
-        const uint local_idx = (sh[0].idx < args.vocab) ? sh[0].idx : 0u;
-        dst[0] = args.has_shortlist ? shortlist_ids[local_idx] : int(local_idx);
+        if (sh[0].idx < args.vocab) {
+            dst[0] = args.has_shortlist ? shortlist_ids[sh[0].idx] : int(sh[0].idx);
+        } else {
+            // No finite candidate (e.g. all-NaN logits): signal invalid token to stop drafting.
+            dst[0] = -1;
+        }
     }
 }
 

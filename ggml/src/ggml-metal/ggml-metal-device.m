@@ -1584,24 +1584,120 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
 
     switch (op->op) {
         case GGML_OP_CUSTOM:
-            return op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_REL_MASK ||
-                   (op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_PREFILL_ATTN &&
-                    has_simdgroup_mm && dev->props.max_theadgroup_memory_size >= 32768) ||
-                   (op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_FLASH_ATTN &&
-                    dev->props.max_theadgroup_memory_size >= 32768 &&
-                    (op->src[0]->ne[2] < 16 || dev->props.has_tensor)) ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CONTROL ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CONV_RESIDUAL ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CLIP ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_SITU ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_MIX ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CTRL_DOWN ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_CTRL_APPLY ||
-                (op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_DSPARK_ARGMAX &&
-                 op->src[0] && (op->src[0]->type == GGML_TYPE_Q8_0 || dev->props.has_bfloat)) ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_MUL_SIGMOID ||
-                op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_SOFTCAP_TRIM ||
-                (dev->props.use_shared_buffers && ggml_metal_is_host_expert(op));
+            {
+                const int32_t tag = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1];
+                if (tag == GGML_METAL_INKLING_REL_MASK ||
+                        tag == GGML_METAL_INKLING_CONTROL ||
+                        tag == GGML_METAL_INKLING_CONV_RESIDUAL ||
+                        tag == GGML_METAL_INKLING_CLIP ||
+                        tag == GGML_METAL_INKLING_SITU) {
+                    return true;
+                }
+                if (tag == GGML_METAL_INKLING_PREFILL_ATTN) {
+                    return has_simdgroup_mm && dev->props.max_theadgroup_memory_size >= 32768;
+                }
+                if (tag == GGML_METAL_INKLING_FLASH_ATTN) {
+                    const struct ggml_tensor * q     = op->src[0];
+                    const struct ggml_tensor * k     = op->src[1];
+                    const struct ggml_tensor * v     = op->src[2];
+                    const struct ggml_tensor * tbl   = op->src[3];
+                    const struct ggml_tensor * sinks = op->src[4];
+                    const struct ggml_tensor * qpos  = op->src[5];
+                    const struct ggml_tensor * kpos  = op->src[6];
+                    const int32_t extent = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
+                    const int32_t n_swa  = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4];
+                    if (!q || !k || !v || !tbl || !sinks || !qpos || !kpos ||
+                            extent <= 0 || n_swa < 0 ||
+                            dev->props.max_theadgroup_memory_size < 32768) {
+                        return false;
+                    }
+                    const bool kv_ok = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) &&
+                                       v->type == k->type;
+                    return kv_ok &&
+                           q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] == 24 && q->ne[2] > 0 && q->ne[3] == 1 &&
+                           k->ne[0] == 128 && k->ne[1] == 8 && k->ne[2] > 0 && (k->ne[2] % 64) == 0 && k->ne[3] == 1 &&
+                           ggml_are_same_shape(k, v) &&
+                           tbl->type == GGML_TYPE_F32 && tbl->ne[0] == extent && tbl->ne[1] == 24 && tbl->ne[2] == q->ne[2] &&
+                           sinks->type == GGML_TYPE_F32 && sinks->ne[0] == 24 && sinks->ne[1] == q->ne[2] &&
+                           qpos->type == GGML_TYPE_I32 && qpos->ne[0] == 2 && qpos->ne[1] == q->ne[2] &&
+                           kpos->type == GGML_TYPE_I32 && kpos->ne[0] == 3 && kpos->ne[1] == k->ne[2] &&
+                           (q->ne[2] < 16 || dev->props.has_tensor);
+                }
+                if (tag == GGML_METAL_INKLING_MIX) {
+                    const int32_t n_states = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
+                    const int32_t n_q      = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2];
+                    if (n_states < 1 || n_states > GGML_METAL_INKLING_MIX_MAX_STATES || n_q < 1 || n_q > 4) {
+                        return false;
+                    }
+                    const struct ggml_tensor * query = op->src[n_states];
+                    if (!query || query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query) ||
+                            query->ne[0] <= 0 || (query->ne[0] % 4) != 0 || query->ne[1] != n_q) {
+                        return false;
+                    }
+                    for (int32_t i = 0; i < n_states; ++i) {
+                        const struct ggml_tensor * s = op->src[i];
+                        if (!s || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
+                                s->ne[0] != query->ne[0] || s->ne[1] != op->ne[1]) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }
+                if (tag == GGML_METAL_INKLING_CTRL_DOWN) {
+                    const struct ggml_tensor * c = op->src[0];
+                    const struct ggml_tensor * m = op->src[1];
+                    const struct ggml_tensor * w = op->src[2];
+                    return c && m && w &&
+                           c->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && w->type == GGML_TYPE_Q8_0 &&
+                           ggml_is_contiguous(c) && ggml_is_contiguous(m) && ggml_is_contiguous(w) &&
+                           ggml_are_same_shape(c, m) && c->ne[0] > 0 && (c->ne[0] % 32) == 0 &&
+                           w->ne[0] == 2 * c->ne[0] && w->ne[1] > 0 && w->ne[1] <= 256;
+                }
+                if (tag == GGML_METAL_INKLING_CTRL_APPLY) {
+                    const struct ggml_tensor * c  = op->src[0];
+                    const struct ggml_tensor * m  = op->src[1];
+                    const struct ggml_tensor * g  = op->src[2];
+                    const struct ggml_tensor * wg = op->src[3];
+                    const struct ggml_tensor * wf = op->src[4];
+                    return c && m && g && wg && wf &&
+                           c->type == GGML_TYPE_F32 && m->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 &&
+                           wg->type == GGML_TYPE_Q8_0 && wf->type == GGML_TYPE_Q8_0 &&
+                           ggml_is_contiguous(c) && ggml_is_contiguous(m) && ggml_is_contiguous(g) &&
+                           ggml_is_contiguous(wg) && ggml_is_contiguous(wf) &&
+                           ggml_are_same_shape(c, m) && ggml_are_same_shape(wg, wf) &&
+                           g->ne[0] > 0 && g->ne[0] <= 256 && (g->ne[0] % 32) == 0 &&
+                           wg->ne[0] == g->ne[0] && wg->ne[1] == c->ne[0];
+                }
+                if (tag == GGML_METAL_INKLING_DSPARK_ARGMAX) {
+                    const struct ggml_tensor * w2   = op->src[0];
+                    const struct ggml_tensor * w2_b = op->src[1];
+                    const struct ggml_tensor * base = op->src[2];
+                    const struct ggml_tensor * lat  = op->src[3];
+                    const struct ggml_tensor * sl   = op->src[4];
+                    if (!w2 || !w2_b || !base || !lat) { return false; }
+                    const bool w2_ok = w2->type == GGML_TYPE_Q8_0 || (w2->type == GGML_TYPE_BF16 && dev->props.has_bfloat);
+                    const bool sl_ok = !sl || (sl->type == GGML_TYPE_I32 && ggml_is_contiguous(sl) && ggml_nelements(sl) == w2->ne[1]);
+                    return w2_ok && sl_ok &&
+                           ggml_is_contiguous(w2) && w2->ne[0] > 0 && w2->ne[0] <= 512 && (w2->ne[0] % 32) == 0 && w2->ne[1] > 0 &&
+                           w2_b->type == GGML_TYPE_F32 && ggml_is_contiguous(w2_b) && ggml_nelements(w2_b) == w2->ne[1] &&
+                           base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && ggml_nelements(base) == w2->ne[1] &&
+                           lat->type == GGML_TYPE_F32 && ggml_is_contiguous(lat) && ggml_nelements(lat) == w2->ne[0];
+                }
+                if (tag == GGML_METAL_INKLING_MUL_SIGMOID) {
+                    const struct ggml_tensor * x = op->src[0];
+                    const struct ggml_tensor * g = op->src[1];
+                    return x && g && x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32 &&
+                           ggml_is_contiguous(x) && ggml_is_contiguous(g) && ggml_are_same_shape(x, g) &&
+                           ggml_nelements(x) > 0 && (ggml_nelements(x) % 4) == 0;
+                }
+                if (tag == GGML_METAL_INKLING_SOFTCAP_TRIM) {
+                    const struct ggml_tensor * s = op->src[0];
+                    return s && s->type == GGML_TYPE_F32 && ggml_is_contiguous(s) &&
+                           s->ne[2] == 1 && s->ne[3] == 1 && s->ne[1] > 0 &&
+                           op->ne[0] > 0 && op->ne[0] <= s->ne[0] && op->ne[1] == s->ne[1];
+                }
+                return dev->props.use_shared_buffers && ggml_metal_is_host_expert(op);
+            }
         case GGML_OP_SCALE:
             return ggml_is_contiguous_rows(op->src[0]) && (op->src[0]->type == GGML_TYPE_F32 || op->src[0]->type == GGML_TYPE_F16 || op->src[0]->type == GGML_TYPE_BF16);
         case GGML_OP_FILL:

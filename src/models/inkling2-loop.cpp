@@ -198,7 +198,9 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
                 continue;
             }
             const auto & loop = m.loop_layers[ip - start];
-            cur = build_layer(il, ip, cur, blocks, mix(bank, bank_out, loop.msg_query), &loop);
+            bool msg_fused = false;
+            auto * msg = mix(bank, bank_out, loop.msg_query, &msg_fused);
+            cur = build_layer(il, ip, cur, blocks, msg, &loop, msg_fused);
         }
     }
 

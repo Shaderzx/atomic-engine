@@ -1422,9 +1422,13 @@ void llm_graph_input_mem_hybrid_iswa_rel::set_input(const llama_ubatch * ubatch)
     }
 
     if (self_q_pos && self_q_pos->buffer) {
-        std::vector<int32_t> qpos(ubatch->n_tokens);
+        std::vector<int32_t> qpos((size_t) ubatch->n_tokens * 2u, 0);
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            qpos[i] = ubatch->pos[i];
+            GGML_ASSERT(ubatch->n_seq_id[i] == 1);
+            const llama_seq_id sid = ubatch->seq_id[i][0];
+            GGML_ASSERT(sid >= 0 && sid < 64);
+            qpos[(size_t) i * 2u + 0u] = ubatch->pos[i];
+            qpos[(size_t) i * 2u + 1u] = (int32_t) sid;
         }
         ggml_backend_tensor_set(self_q_pos, qpos.data(), 0, ggml_nbytes(self_q_pos));
     }
@@ -1479,11 +1483,21 @@ bool llm_graph_input_mem_hybrid_iswa_rel::can_reuse(const llm_graph_params & par
     }
 
     if (self_k_pos) {
-        res &= !params.cparams.training && params.cparams.causal_attn &&
-               params.ubatch.n_seqs == 1 && params.ubatch.n_seqs_unq == 1;
-        res &= self_q_pos->ne[0] == params.ubatch.n_tokens;
-        res &= self_k_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
-        res &= self_k_pos_swa->ne[0] == attn_ctx->get_swa()->get_n_kv();
+        bool seq_ok = !params.cparams.training && params.cparams.causal_attn &&
+                      (params.cparams.kv_unified || params.cparams.n_seq_max == 1) &&
+                      params.cparams.n_seq_max <= 64 && params.ubatch.n_seqs <= 64;
+        if (seq_ok && params.ubatch.n_seq_id && params.ubatch.seq_id) {
+            for (uint32_t i = 0; i < params.ubatch.n_tokens; ++i) {
+                if (params.ubatch.n_seq_id[i] != 1 || params.ubatch.seq_id[i][0] < 0 || params.ubatch.seq_id[i][0] >= 64) {
+                    seq_ok = false;
+                    break;
+                }
+            }
+        }
+        res &= seq_ok;
+        res &= self_q_pos->ne[1] == params.ubatch.n_tokens;
+        res &= self_k_pos->ne[1] == attn_ctx->get_base()->get_n_kv();
+        res &= self_k_pos_swa->ne[1] == attn_ctx->get_swa()->get_n_kv();
     } else {
         res &= can_reuse_kq_mask(inp_attn->self_attn_mask.raw, attn_ctx->get_base(), params.ubatch, params.cparams);
         res &= self_rel_pos->ne[0] == attn_ctx->get_base()->get_n_kv();
@@ -1571,6 +1585,7 @@ void llm_graph_result::reset() {
     t_embd        = nullptr;
     t_embd_pooled = nullptr;
     t_h_nextn     = nullptr;
+    t_draft_ids   = nullptr;
 
     t_layer_inp.resize(LLAMA_MAX_LAYERS + 1);
     std::fill(t_layer_inp.begin(), t_layer_inp.end(), nullptr);
@@ -4004,8 +4019,14 @@ static ggml_tensor * build_attn_iswa_impl(
     ggml_tensor * cur = nullptr;
     if (flash && flash->create) {
         cur = flash->create(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos, kq_scale, flash_extent, flash_n_swa);
-        GGML_ASSERT(cur && ggml_backend_supports_op(flash->backend, cur));
-        ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
+        if (cur && ggml_backend_supports_op(flash->backend, cur)) {
+            ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
+        } else {
+            cur = nullptr;
+            if (!kq_mask) {
+                throw std::runtime_error("Inkling fused flash attention rejected a layer after omitting dense kq_mask");
+            }
+        }
     }
     if (!cur && prefill && prefill->create) {
         cur = prefill->create(ctx0, q, k, v, kq_mask, kq_scale);
@@ -4640,15 +4661,15 @@ llm_graph_input_mem_hybrid_iswa_rel * llm_graph_context::build_inp_mem_hybrid_is
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_iswa_rel>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur, extent, extent_swa);
 
     if (fused_rel_attn) {
-        inp->self_q_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, ubatch.n_tokens);
+        inp->self_q_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, ubatch.n_tokens);
         ggml_set_input(inp->self_q_pos);
         ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
 
-        inp->self_k_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_base()->get_n_kv());
+        inp->self_k_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, attn_ctx->get_base()->get_n_kv());
         ggml_set_input(inp->self_k_pos);
         ggml_set_name(inp->self_k_pos, "attn_inp_k_pos");
 
-        inp->self_k_pos_swa = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, attn_ctx->get_swa()->get_n_kv());
+        inp->self_k_pos_swa = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 3, attn_ctx->get_swa()->get_n_kv());
         ggml_set_input(inp->self_k_pos_swa);
         ggml_set_name(inp->self_k_pos_swa, "attn_inp_k_pos_swa");
     } else {

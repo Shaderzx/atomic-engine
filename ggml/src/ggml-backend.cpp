@@ -245,10 +245,17 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
 
         // [TAG_ALLOC_SIZE_EXPAND]
         // if you hit this assert, update ggml_backend_op_alloc_size_may_expand() accordingly
+        const int32_t custom_tag = tensor->op == GGML_OP_CUSTOM
+                ? tensor->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1]
+                : 0;
+        const bool inkling_custom_tail_scratch =
+                tensor->op == GGML_OP_CUSTOM &&
+                (custom_tag == 0x4154453A || custom_tag == 0x4154453E);
         GGML_ASSERT(size <= ggml_nbytes(tensor) ||
                     ggml_op_is_empty(tensor->op) ||
                     ggml_is_quantized(tensor->type) || // [TAG_ALLOC_SIZE_EXPAND]
-                    ggml_op_alloc_size_may_expand(tensor->op));
+                    ggml_op_alloc_size_may_expand(tensor->op) ||
+                    inkling_custom_tail_scratch);
 
         return size;
     }
@@ -2775,7 +2782,6 @@ bool ggml_op_alloc_size_may_expand(enum ggml_op op) {
         case GGML_OP_ARGSORT:
         case GGML_OP_TOP_K:
         case GGML_OP_ARGMAX:
-        case GGML_OP_CUSTOM:
         case GGML_OP_CONV_2D:
             return true;
         default:

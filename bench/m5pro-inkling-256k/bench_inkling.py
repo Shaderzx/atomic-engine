@@ -320,20 +320,25 @@ def run(cfg_path, long_ctx=None, reps=6, max_tokens=256, greedy_check=False, war
             if not r["completion_tokens"] or r["completion_tokens"] < 16:
                 flags.append("SHORT_OUT")
         res["c1_decode"] = round(statistics.median(c1), 2) if c1 else None
+        res["c1_min"] = min(c1) if c1 else None
+        res["c1_max"] = max(c1) if c1 else None
         res["c1_all"] = c1
         if c1_srv:
             res["c1_srv_med"] = round(statistics.median(c1_srv), 2)
         res.update(parse_server_log_stats(log_path, decode_log_offset))
-        log(f"[{cfg['name']}] c1 median={res['c1_decode']} tok/s all={c1} draft_acc={res.get('draft_accept_med')} mean_len={res.get('draft_mean_len_med')}")
+        log(f"[{cfg['name']}] c1 median={res['c1_decode']} (min={res['c1_min']} max={res['c1_max']}) tok/s all={c1} draft_acc={res.get('draft_accept_med')} mean_len={res.get('draft_mean_len_med')}")
 
-        # Prefill lengths (cold, unique documents)
+        # Prefill lengths (cold, unique documents): record both end-to-end (prompt/TTFT) and server prompt_per_second
         for L in cfg.get("prefill_lengths", [4096, 32768]):
             prompt, _ = document(L, seed=L)
             r = srv.chat(prompt, 1, temperature=0.0)
             res[f"prefill_{L}"] = round(r["prompt_tokens"] / r["ttft"], 1) if r["prompt_tokens"] else None
+            srv_pp = r["timings"].get("prompt_per_second")
+            if srv_pp:
+                res[f"prefill_{L}_srv"] = round(srv_pp, 1)
             res[f"prefill_{L}_tokens"] = r["prompt_tokens"]
             res[f"prefill_{L}_ttft_s"] = round(r["ttft"], 2)
-            log(f"[{cfg['name']}] prefill ~{L}: {res[f'prefill_{L}']} tok/s ({r['prompt_tokens']} toks in {r['ttft']:.2f}s)")
+            log(f"[{cfg['name']}] prefill ~{L}: e2e={res[f'prefill_{L}']} srv={res.get(f'prefill_{L}_srv')} tok/s ({r['prompt_tokens']} toks in {r['ttft']:.2f}s)")
             if warm_check and L == max(cfg.get("prefill_lengths", [4096])):
                 r_warm = srv.chat(prompt + " Confirm.", 4, temperature=0.0)
                 res[f"warm_{L}_ttft_ms"] = round(r_warm["ttft"] * 1000, 1)
@@ -349,6 +354,7 @@ def run(cfg_path, long_ctx=None, reps=6, max_tokens=256, greedy_check=False, war
                 "prompt_tokens": r["prompt_tokens"],
                 "ttft_s": round(r["ttft"], 2),
                 "prefill": round(r["prompt_tokens"] / r["ttft"], 1) if r["prompt_tokens"] else None,
+                "prefill_srv": round(r["timings"]["prompt_per_second"], 1) if r["timings"].get("prompt_per_second") else None,
                 "decode": round(r["decode"], 2) if r["decode"] else None,
                 "retrieval": f"{hits}/{len(codes)}",
                 "codes_expected": codes,
@@ -365,7 +371,7 @@ def run(cfg_path, long_ctx=None, reps=6, max_tokens=256, greedy_check=False, war
                 gout[key] = r["text"]
             res["greedy_outputs"] = gout
 
-        res["ok"] = True
+        res["ok"] = ("NEEDLE_MISS" not in flags)
     except Exception as e:
         res.update(ok=False, error=repr(e))
         flags.append("REQ_FAIL")

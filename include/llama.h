@@ -1225,6 +1225,13 @@ extern "C" {
     // Returns whether decode accepts batches with state rows.
     LLAMA_API bool llama_set_ctx_state_src(struct llama_context * ctx, struct llama_context * ctx_src);
 
+    // Opt in to fused GPU greedy argmax on compatible draft heads (e.g. Inkling2 DSpark).
+    // When enabled and supported, decode skips 200K logit readback and exposes exact int32 token IDs via llama_get_draft_ids().
+    LLAMA_API void    llama_set_dspark_fast_argmax(struct llama_context * ctx, bool value);
+    // Copy GPU-selected draft token IDs from the most recent decode into `out` (up to `max_n`).
+    // Returns the number of IDs produced (>= 0), or -1 if the last decode did not use the fast draft-ID path.
+    LLAMA_API int32_t llama_get_draft_ids(struct llama_context * ctx, llama_token * out, int32_t max_n);
+
     // The paired context (llama_context_params::ctx_other), e.g. the target context of a draft context; may be nullptr
     LLAMA_API struct llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
