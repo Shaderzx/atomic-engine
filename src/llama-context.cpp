@@ -5721,9 +5721,14 @@ void llama_opt_epoch(
 }
 
 int32_t llama_process(llama_context * ctx, llama_process_type type, llama_batch_ext * batch) {
-    switch (type) {
-        case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
-        case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+    try {
+        switch (type) {
+            case LLAMA_PROCESS_TYPE_ENCODE: return ctx->encode(*batch);
+            case LLAMA_PROCESS_TYPE_DECODE: return ctx->decode(*batch);
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: exception during process: %s\n", __func__, e.what());
+        return -2;
     }
     return -1;
 }

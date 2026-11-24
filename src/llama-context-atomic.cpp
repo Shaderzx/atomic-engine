@@ -235,7 +235,12 @@ bool llama_expert_cache_policy_set(llama_context * ctx, const char * policy) {
 }
 
 int32_t llama_expert_prefill_decode(llama_context * ctx, llama_batch_ext * batch, size_t uncached_prompt_tokens) {
-    return ctx->decode(*batch, uncached_prompt_tokens);
+    try {
+        return ctx->decode(*batch, uncached_prompt_tokens);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: exception during prefill decode: %s\n", __func__, e.what());
+        return -2;
+    }
 }
 
 bool llama_context::expert_trace_set(llama_expert_trace_callback callback, void * user) {

@@ -34,6 +34,10 @@ PARITY_PROMPTS = [
 
 def start_server(args, extra_env=None, log_path="/tmp/inkling-verify.log"):
     env = os.environ.copy()
+    # Strip ambient Inkling toggle env vars so every run's exact fusion/draft state is controlled explicitly.
+    for k in list(env):
+        if k.startswith(("LLAMA_INKLING_", "LLAMA_EXPERIMENTAL_INKLING_")):
+            del env[k]
     if extra_env:
         env.update(extra_env)
     fp = open(log_path, "wb")
@@ -133,6 +137,22 @@ def compare_panels(name, ref, cand):
 
 def main():
     summary = {}
+    target_on_env = {
+        "LLAMA_INKLING_FUSED_ATTN": "1",
+        "LLAMA_INKLING_FUSED_KERNELS": "1",
+        "LLAMA_INKLING_FUSED_MIX": "1",
+        "LLAMA_INKLING_FUSED_CTRL": "1",
+    }
+    target_off_env = {
+        "LLAMA_INKLING_FUSED_ATTN": "0",
+        "LLAMA_INKLING_FUSED_KERNELS": "0",
+        "LLAMA_INKLING_FUSED_MIX": "0",
+        "LLAMA_INKLING_FUSED_CTRL": "0",
+    }
+    draft_fixed_env = {
+        "LLAMA_INKLING_DSPARK_FAST": "0",
+        "LLAMA_INKLING_PROMPT_LOOKUP": "0",
+    }
 
     # 1. MTL_SHADER_VALIDATION=1 at -c 262144 (F16 KV + DSpark n_max=2) — >32,768 tokens + verified live nwg=32 GPU dispatch
     print("=== [1/4] MTL_SHADER_VALIDATION=1 at -c 262144 (n_kv > 32768 -> logged nwg=32 dispatch) ===", flush=True)
@@ -141,7 +161,8 @@ def main():
         ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2", "--spec-draft-n-ubatch", "512",
          "-c", "262144", "-b", "2048", "-ub", "2048", "-np", "1",
          "-ctk", "f16", "-ctv", "f16", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"],
-        extra_env={"MTL_SHADER_VALIDATION": "1", "GGML_METAL_INKLING_LOG_DISPATCH": "1"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1",
+                   "MTL_SHADER_VALIDATION": "1", "GGML_METAL_INKLING_LOG_DISPATCH": "1"},
         log_path=sv_log,
     )
     try:
@@ -175,6 +196,7 @@ def main():
         ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2", "--spec-draft-n-ubatch", "512",
          "-c", "262144", "-b", "1024", "-ub", "1024", "-np", "2", "--kv-unified",
          "-ctk", "f16", "-ctv", "f16", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"],
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1"},
         log_path="/tmp/inkling-verify-np2.log",
     )
     try:
@@ -199,50 +221,40 @@ def main():
         stop_server(proc, fp)
 
     # 3. Strictly single-variable controlled parity across ALL 3 KV types (f16, q8_0, q4_0):
-    #    - target_fused_on_vs_off_nospec_{kv} : ONLY target fusions toggle (nospec both sides)
-    #    - target_fused_on_vs_off_spec_{kv}   : ONLY target fusions toggle (DSpark n_max=2 + identical draft settings both sides!)
-    #    - spec_vs_nospec_target_off_{kv}     : ONLY spec toggles (target fusions OFF both sides, fixed draft ref)
-    #    - spec_vs_nospec_target_on_{kv}      : ONLY spec toggles (target fusions ON both sides, fixed draft ref)
+    #    - target_fused_on_vs_off_nospec_{kv} : ONLY target fusions toggle (explicit 0 vs 1, nospec both sides)
+    #    - target_fused_on_vs_off_spec_{kv}   : ONLY target fusions toggle (explicit 0 vs 1, DSpark n_max=2 + identical draft_fixed_env both sides!)
+    #    - spec_vs_nospec_target_off_{kv}     : ONLY spec toggles (target fusions explicitly 0 both sides, fixed draft ref)
+    #    - spec_vs_nospec_target_on_{kv}      : ONLY spec toggles (target fusions explicitly 1 both sides, fixed draft ref)
     print("=== [3/4] Strictly single-variable Target Fusion parity across F16, Q8_0, Q4_0 ===", flush=True)
-    target_off_env = {
-        "LLAMA_INKLING_FUSED_ATTN": "0",
-        "LLAMA_INKLING_FUSED_KERNELS": "0",
-        "LLAMA_INKLING_FUSED_MIX": "0",
-        "LLAMA_INKLING_FUSED_CTRL": "0",
-    }
-    draft_fixed_env = {
-        "LLAMA_INKLING_DSPARK_FAST": "0",
-        "LLAMA_INKLING_PROMPT_LOOKUP": "0",
-    }
     parity_results = []
     for kv in ["f16", "q8_0", "q4_0"]:
         base_args = ["-c", "4096", "-b", "512", "-ub", "512", "-np", "1", "-ctk", kv, "-ctv", kv]
         spec_args = base_args + ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2",
                                  "--spec-draft-n-ubatch", "512", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"]
 
-        # A: target fusions OFF, nospec
+        # A: target fusions explicitly OFF, nospec
         proc, fp, _ = start_server(base_args, extra_env=target_off_env, log_path=f"/tmp/inkling-verify-off-nospec-{kv}.log")
         try:
             ref_nospec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
 
-        # B: target fusions OFF, DSpark n_max=2 (fixed draft ref)
+        # B: target fusions explicitly OFF, DSpark n_max=2 (fixed draft ref)
         proc, fp, _ = start_server(spec_args, extra_env={**target_off_env, **draft_fixed_env}, log_path=f"/tmp/inkling-verify-off-spec-{kv}.log")
         try:
             ref_spec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
 
-        # C: target fusions ON, nospec
-        proc, fp, _ = start_server(base_args, log_path=f"/tmp/inkling-verify-on-nospec-{kv}.log")
+        # C: target fusions explicitly ON, nospec
+        proc, fp, _ = start_server(base_args, extra_env=target_on_env, log_path=f"/tmp/inkling-verify-on-nospec-{kv}.log")
         try:
             on_nospec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
 
-        # D: target fusions ON, DSpark n_max=2 (SAME fixed draft ref as B — ONLY target fusions change!)
-        proc, fp, _ = start_server(spec_args, extra_env=draft_fixed_env, log_path=f"/tmp/inkling-verify-on-spec-{kv}.log")
+        # D: target fusions explicitly ON, DSpark n_max=2 (SAME fixed draft ref as B — ONLY target fusions change!)
+        proc, fp, _ = start_server(spec_args, extra_env={**target_on_env, **draft_fixed_env}, log_path=f"/tmp/inkling-verify-on-spec-{kv}.log")
         try:
             on_spec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
@@ -254,30 +266,67 @@ def main():
         parity_results.append(compare_panels(f"spec_vs_nospec_target_on_{kv}",       on_nospec,  on_spec))
     summary["parity"] = parity_results
 
-    # 4. Strictly single-variable Draft Optimization parity on F16 (target fusions held fixed ON)
-    print("=== [4/4] Single-variable Draft Optimization parity (DSpark fast-argmax & prompt-lookup) ===", flush=True)
+    # 4. Strictly single-variable Draft Optimization parity on F16 (target fusions explicitly fixed ON)
+    print("=== [4/4] Single-variable Draft Optimization parity (DSpark fast-argmax & prompt-lookup with verified hits) ===", flush=True)
     spec_f16 = ["-c", "4096", "-b", "512", "-ub", "512", "-np", "1", "-ctk", "f16", "-ctv", "f16",
                 "-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2",
                 "--spec-draft-n-ubatch", "512", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"]
-    # 4a: DSPARK_FAST=0 vs DSPARK_FAST=1 (PROMPT_LOOKUP=0 fixed on both sides)
-    proc, fp, _ = start_server(spec_f16, extra_env={"LLAMA_INKLING_DSPARK_FAST": "0", "LLAMA_INKLING_PROMPT_LOOKUP": "0"}, log_path="/tmp/inkling-verify-dft-ref.log")
+    lookup_prompts = PARITY_PROMPTS[:5] + [
+        "Repeat the following paragraph verbatim with no extra commentary:\n"
+        "The M5 Pro unified memory architecture streams quantized MoE weights directly through "
+        "Metal 4 tensor accelerators while preserving full FP16 key-value precision across 262,144 tokens."
+    ]
+    # 4a: DSPARK_FAST=0 vs DSPARK_FAST=1 (target_on_env + PROMPT_LOOKUP=0 fixed on both sides)
+    proc, fp, _ = start_server(
+        spec_f16,
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "0", "LLAMA_INKLING_PROMPT_LOOKUP": "0"},
+        log_path="/tmp/inkling-verify-dft-ref.log",
+    )
     try:
         dft_ref = run_panel(PARITY_PROMPTS[:6], max_tokens=48, logprobs=True)
     finally:
         stop_server(proc, fp)
-    proc, fp, _ = start_server(spec_f16, extra_env={"LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0"}, log_path="/tmp/inkling-verify-dft-fast.log")
+    proc, fp, _ = start_server(
+        spec_f16,
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0"},
+        log_path="/tmp/inkling-verify-dft-fast.log",
+    )
     try:
         dft_fast = run_panel(PARITY_PROMPTS[:6], max_tokens=48, logprobs=True)
     finally:
         stop_server(proc, fp)
-    # 4b: PROMPT_LOOKUP=0 vs PROMPT_LOOKUP=1 (DSPARK_FAST=1 fixed on both sides)
-    proc, fp, _ = start_server(spec_f16, extra_env={"LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1"}, log_path="/tmp/inkling-verify-dft-pl.log")
+    summary["dspark_fast_vs_ref"] = compare_panels("dspark_fast_on_vs_off_f16", dft_ref, dft_fast)
+
+    # 4b: PROMPT_LOOKUP=0 vs PROMPT_LOOKUP=1 (target_on_env + DSPARK_FAST=1 fixed on both sides; requires >=1 actual lookup hit!)
+    pl_off_log = "/tmp/inkling-verify-pl-off.log"
+    pl_on_log  = "/tmp/inkling-verify-pl-on.log"
+    proc, fp, _ = start_server(
+        spec_f16,
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0", "LLAMA_INKLING_LOG_LOOKUP": "1"},
+        log_path=pl_off_log,
+    )
     try:
-        dft_fast_pl = run_panel(PARITY_PROMPTS[:6], max_tokens=48, logprobs=True)
+        pl_off = run_panel(lookup_prompts, max_tokens=48, logprobs=True)
     finally:
         stop_server(proc, fp)
-    summary["dspark_fast_vs_ref"] = compare_panels("dspark_fast_on_vs_off_f16", dft_ref, dft_fast)
-    summary["prompt_lookup_vs_off"] = compare_panels("prompt_lookup_on_vs_off_f16", dft_fast, dft_fast_pl)
+    proc, fp, _ = start_server(
+        spec_f16,
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1", "LLAMA_INKLING_LOG_LOOKUP": "1"},
+        log_path=pl_on_log,
+    )
+    try:
+        pl_on = run_panel(lookup_prompts, max_tokens=48, logprobs=True)
+    finally:
+        stop_server(proc, fp)
+    pl_hits_off = sum("inkling_prompt_lookup: hit" in ln for ln in open(pl_off_log, errors="replace"))
+    pl_hits_on  = sum("inkling_prompt_lookup: hit" in ln for ln in open(pl_on_log, errors="replace"))
+    assert pl_hits_off == 0, f"Expected 0 prompt-lookup hits when PROMPT_LOOKUP=0, got {pl_hits_off}"
+    assert pl_hits_on > 0, f"Expected >=1 prompt-lookup hit when PROMPT_LOOKUP=1 on verbatim-repeat panel, got {pl_hits_on}"
+    pl_res = compare_panels("prompt_lookup_on_vs_off_f16", pl_off, pl_on)
+    pl_res["lookup_hits_off"] = pl_hits_off
+    pl_res["lookup_hits_on"] = pl_hits_on
+    summary["prompt_lookup_vs_off"] = pl_res
+    print("PASS prompt_lookup_hits:", json.dumps({"lookup_hits_off": pl_hits_off, "lookup_hits_on": pl_hits_on}), flush=True)
 
     out_path = f"{ROOT}/bench/m5pro-inkling-256k/parity-report.json"
     with open(out_path, "w") as f:

@@ -16,6 +16,8 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iomanip>
@@ -1560,6 +1562,14 @@ protected:
         }
         dp.result->assign(history.begin() + best_end, history.begin() + best_end + count);
         LOG_DBG("%s: matched %zu tokens at pos %zu, proposing %d tokens\n", __func__, best_matched, best_end, count);
+        static const bool log_lookup = []() {
+            const char * v = std::getenv("LLAMA_INKLING_LOG_LOOKUP");
+            return v && std::strcmp(v, "1") == 0;
+        }();
+        if (log_lookup) {
+            std::fprintf(stderr, "inkling_prompt_lookup: hit matched=%zu count=%d\n", best_matched, count);
+            std::fflush(stderr);
+        }
         return true;
     }
 

@@ -10,7 +10,7 @@
   },
   "multi_slot_np2_256k": {
     "ok": true,
-    "startup_s": 2.13,
+    "startup_s": 1.51,
     "slot0_tokens": 96,
     "slot1_tokens": 96,
     "drop_to_1_answer": "391"
@@ -141,6 +141,8 @@
     "first_token_match": "6/6",
     "prefix_token_agreement": "288/288 (100.0%)",
     "max_matched_logprob_diff": 0.0,
-    "med_matched_logprob_diff": 0.0
+    "med_matched_logprob_diff": 0.0,
+    "lookup_hits_off": 0,
+    "lookup_hits_on": 7
   }
 }
