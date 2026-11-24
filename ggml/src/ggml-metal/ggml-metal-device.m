@@ -1726,6 +1726,35 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     }
                     return true;
                 }
+                if (tag == GGML_METAL_INKLING_MOE_FFN) {
+                    const struct ggml_tensor * cur     = op->src[0];
+                    const struct ggml_tensor * ids     = op->src[1];
+                    const struct ggml_tensor * gate_up = op->src[2];
+                    const struct ggml_tensor * down    = op->src[3];
+                    if (!cur || !ids || !gate_up || !down ||
+                            cur->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+                            !ggml_is_contiguous(cur) || !ggml_is_contiguous(gate_up) || !ggml_is_contiguous(down) ||
+                            !ggml_is_matrix(ids) || ids->nb[0] != sizeof(int32_t) || (ids->nb[1] % sizeof(int32_t)) != 0 ||
+                            cur->ne[1] != 1 || cur->ne[3] != 1 ||
+                            ids->ne[0] != 8 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
+                            cur->ne[2] != ids->ne[1] ||
+                            gate_up->ne[0] != cur->ne[0] || (gate_up->ne[0] % 256) != 0 ||
+                            (gate_up->ne[1] % 8) != 0 || gate_up->ne[1] <= 0 ||
+                            gate_up->ne[2] < 8 || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
+                            down->ne[0] != gate_up->ne[1] / 2 || (down->ne[0] % 64) != 0 ||
+                            down->ne[1] != cur->ne[0] || (down->ne[1] % 4) != 0 ||
+                            down->ne[2] != gate_up->ne[2] || down->ne[3] != 1) {
+                        return false;
+                    }
+                    const bool gu_ok = gate_up->type == GGML_TYPE_Q4_0 ||
+                                       gate_up->type == GGML_TYPE_Q4_K ||
+                                       gate_up->type == GGML_TYPE_IQ2_XXS;
+                    const bool dn_ok = down->type == GGML_TYPE_Q4_0 ||
+                                       down->type == GGML_TYPE_Q5_0 ||
+                                       down->type == GGML_TYPE_Q2_0 ||
+                                       down->type == GGML_TYPE_IQ4_NL;
+                    return gu_ok && dn_ok;
+                }
                 if (tag == GGML_METAL_INKLING_CTRL_DOWN) {
                     const struct ggml_tensor * c = op->src[0];
                     const struct ggml_tensor * m = op->src[1];

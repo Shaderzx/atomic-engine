@@ -3548,3 +3548,432 @@ template [[host_name("kernel_mul_mv_id_iq2_s_f32_address")]]   kernel kernel_mul
 template [[host_name("kernel_mul_mv_id_iq4_nl_f32_address")]]  kernel kernel_mul_mv_address_t kernel_mul_mv_address<mmv_fn<kernel_mul_mv_iq4_nl_f32_impl <N_R0_IQ4_NL>>>;
 template [[host_name("kernel_mul_mv_id_iq4_xs_f32_address")]]  kernel kernel_mul_mv_address_t kernel_mul_mv_address<mmv_fn<kernel_mul_mv_iq4_xs_f32_impl <N_R0_IQ4_XS>>>;
 template [[host_name("kernel_mul_mv_id_tq2_0_f32_address")]]   kernel kernel_mul_mv_address_t kernel_mul_mv_address<mmv_fn<kernel_mul_mv_tq2_0_f32_impl  <N_R0_TQ2_0>>>;
+
+// ==================================================================================================
+// Inkling2 Direct Per-Slot Fused MoE FFN (M = 1..11):
+//   1) kernel_inkling_moe_gate_up_situ_* (Q4_0, Q4_K, IQ2_XXS) - fuses gate_up + SiTU in registers
+//   2) kernel_inkling_moe_down_*         (Q4_0, Q5_0, Q2_0, IQ4_NL) - full NR0=4 reuse, zero plan barrier
+// ==================================================================================================
+
+struct inkling_moe_gu_args {
+    uint32_t n_embd;
+    uint32_t n_ff;       // half of gate_up ne01
+    uint32_t n_tokens;
+    uint32_t ids_stride; // in int32 elements
+    uint64_t nb01;
+    uint64_t nb02;
+    uint64_t nb12;       // token stride of input cur [n_embd, 1, n_tokens] in bytes
+    float    beta;
+    float    inv_beta;
+    float    linear_beta;
+    float    inv_linear_beta;
+};
+
+struct inkling_moe_down_args {
+    uint32_t n_ff;
+    uint32_t n_embd;
+    uint32_t n_tokens;
+    uint32_t ids_stride;
+    uint64_t nb01;
+    uint64_t nb02;
+};
+
+inline float inkling_apply_situ(float g, float u, constant inkling_moe_gu_args & args) {
+    #pragma clang fp contract(off)
+    #pragma clang fp reassociate(off)
+    const float curved  = args.beta * precise::tanh(g * args.inv_beta);
+    const float sigmoid = 1.0f / (1.0f + exp(-g));
+    float up_act = u;
+    if (args.linear_beta > 0.0f) {
+        up_act = args.linear_beta * precise::tanh(u * args.inv_linear_beta);
+    }
+    return (curved * sigmoid) * up_act;
+}
+
+inline bool inkling_load_slot(
+        uint32_t n_tokens,
+        uint32_t ids_stride,
+        uint32_t gy,
+        device const int32_t * ids,
+        thread uint32_t      & expert_id,
+        thread uint32_t      & tok) {
+    if (gy >= n_tokens * 8u) { return false; }
+    tok = gy >> 3;
+    const int32_t e = ids[tok * ids_stride + (gy & 7u)];
+    if (e < 0) { return false; }
+    expert_id = uint32_t(e);
+    return true;
+}
+
+// --- 1. gate_up + SiTU: Q4_0 (direct per-slot, zero plan barrier, zero load imbalance, NR0=2 pairs = 4 rows/sg) ---
+kernel void kernel_inkling_moe_gate_up_situ_q4_0(
+        constant inkling_moe_gu_args & args    [[buffer(0)]],
+        device const char            * weights [[buffer(1)]],
+        device const char            * x       [[buffer(2)]],
+        device const int32_t         * ids     [[buffer(3)]],
+        device       float           * situ    [[buffer(4)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t first_row = (tgpig.x * 4u + sg) * 2u;
+    if (first_row >= args.n_ff) { return; }
+
+    const int nb = int(args.n_embd / QK4_0);
+    const short ix = lane / 2;
+    const short il = (lane % 2) * 8;
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_q4_0 * ag0 = (device const block_q4_0 *)(e_base + (uint64_t)(first_row + 0u) * args.nb01);
+    device const block_q4_0 * ag1 = (device const block_q4_0 *)(e_base + (uint64_t)(first_row + 1u) * args.nb01);
+    device const block_q4_0 * au0 = (device const block_q4_0 *)(e_base + (uint64_t)(first_row + args.n_ff + 0u) * args.nb01);
+    device const block_q4_0 * au1 = (device const block_q4_0 *)(e_base + (uint64_t)(first_row + args.n_ff + 1u) * args.nb01);
+    device const float * yb = (device const float *)(x + (uint64_t)tok * args.nb12) + ix * QK4_0 + il;
+    float sg0 = 0.0f, sg1 = 0.0f, su0 = 0.0f, su1 = 0.0f;
+    float yl[16];
+    for (int ib = ix; ib < nb; ib += 16) {
+        float sumy = 0.0f;
+        FOR_UNROLL (short i = 0; i < 8; i += 2) {
+            sumy     += yb[i + 0] + yb[i + 1] + yb[i + 16] + yb[i + 17];
+            yl[i + 0] = yb[i + 0];
+            yl[i + 1] = yb[i + 1]  * (1.0f / 256.0f);
+            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+        }
+        sg0 += block_q_n_dot_y(ag0 + ib, sumy, yl, il);
+        sg1 += block_q_n_dot_y(ag1 + ib, sumy, yl, il);
+        su0 += block_q_n_dot_y(au0 + ib, sumy, yl, il);
+        su1 += block_q_n_dot_y(au1 + ib, sumy, yl, il);
+        yb += QK4_0 * 16;
+    }
+    const float g0 = simd_sum(sg0), g1 = simd_sum(sg1);
+    const float u0 = simd_sum(su0), u1 = simd_sum(su1);
+    if (lane == 0u) {
+        device float * dst = situ + (uint64_t)tgpig.y * args.n_ff;
+        dst[first_row + 0u] = inkling_apply_situ(g0, u0, args);
+        dst[first_row + 1u] = inkling_apply_situ(g1, u1, args);
+    }
+}
+
+// --- 2. gate_up + SiTU: Q4_K (direct per-slot, NR0=1 pair = 2 rows/sg matching N_R0_Q4_K=2) ---
+kernel void kernel_inkling_moe_gate_up_situ_q4_K(
+        constant inkling_moe_gu_args & args    [[buffer(0)]],
+        device const char            * weights [[buffer(1)]],
+        device const char            * x       [[buffer(2)]],
+        device const int32_t         * ids     [[buffer(3)]],
+        device       float           * situ    [[buffer(4)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t row = tgpig.x * 4u + sg;
+    if (row >= args.n_ff) { return; }
+
+    constexpr uint16_t kmask1 = 0x3f3f;
+    constexpr uint16_t kmask2 = 0x0f0f;
+    constexpr uint16_t kmask3 = 0xc0c0;
+    const short ix = lane / 8;
+    const short it = lane % 8;
+    const short iq = it / 4;
+    const short ir = it % 4;
+    const int nb = int(args.n_embd / QK_K);
+
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_q4_K * xg = (device const block_q4_K *)(e_base + (uint64_t)row * args.nb01);
+    device const block_q4_K * xu = (device const block_q4_K *)(e_base + (uint64_t)(row + args.n_ff) * args.nb01);
+    device const float * y4 = (device const float *)(x + (uint64_t)tok * args.nb12) + ix * QK_K + 64 * iq + 8 * ir;
+
+    float yl[16], yh[16];
+    float sg_acc = 0.0f, su_acc = 0.0f;
+    uint16_t sc16[4];
+    thread const uint8_t * sc8 = (thread const uint8_t *)sc16;
+
+    for (int ib = ix; ib < nb; ib += 4) {
+        float4 sumy = {0.f, 0.f, 0.f, 0.f};
+        for (short i = 0; i < 8; ++i) {
+            yl[i + 0] = y4[i +   0]; sumy[0] += yl[i + 0];
+            yl[i + 8] = y4[i +  32]; sumy[1] += yl[i + 8];
+            yh[i + 0] = y4[i + 128]; sumy[2] += yh[i + 0];
+            yh[i + 8] = y4[i + 160]; sumy[3] += yh[i + 8];
+        }
+        // gate row
+        {
+            device const uint16_t * sc = (device const uint16_t *)xg[ib].scales + iq;
+            device const uint16_t * q1 = (device const uint16_t *)xg[ib].qs + 16 * iq + 4 * ir;
+            device const uint16_t * q2 = q1 + 32;
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            float4 acc1 = {0.f}, acc2 = {0.f};
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+            sg_acc += float(xg[ib].d) * ((acc1[0] + (1.f/256.f) * acc1[1]) * sc8[0] +
+                                         (acc1[2] + (1.f/256.f) * acc1[3]) * sc8[1] * (1.f/16.f) +
+                                         (acc2[0] + (1.f/256.f) * acc2[1]) * sc8[4] +
+                                         (acc2[2] + (1.f/256.f) * acc2[3]) * sc8[5] * (1.f/16.f)) -
+                      float(xg[ib].dmin) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+        // up row
+        {
+            device const uint16_t * sc = (device const uint16_t *)xu[ib].scales + iq;
+            device const uint16_t * q1 = (device const uint16_t *)xu[ib].qs + 16 * iq + 4 * ir;
+            device const uint16_t * q2 = q1 + 32;
+            sc16[0] = sc[0] & kmask1;
+            sc16[1] = sc[2] & kmask1;
+            sc16[2] = ((sc[4] >> 0) & kmask2) | ((sc[0] & kmask3) >> 2);
+            sc16[3] = ((sc[4] >> 4) & kmask2) | ((sc[2] & kmask3) >> 2);
+            float4 acc1 = {0.f}, acc2 = {0.f};
+            FOR_UNROLL (short i = 0; i < 4; ++i) {
+                acc1[0] += yl[2*i + 0] * (q1[i] & 0x000F);
+                acc1[1] += yl[2*i + 1] * (q1[i] & 0x0F00);
+                acc1[2] += yl[2*i + 8] * (q1[i] & 0x00F0);
+                acc1[3] += yl[2*i + 9] * (q1[i] & 0xF000);
+                acc2[0] += yh[2*i + 0] * (q2[i] & 0x000F);
+                acc2[1] += yh[2*i + 1] * (q2[i] & 0x0F00);
+                acc2[2] += yh[2*i + 8] * (q2[i] & 0x00F0);
+                acc2[3] += yh[2*i + 9] * (q2[i] & 0xF000);
+            }
+            su_acc += float(xu[ib].d) * ((acc1[0] + (1.f/256.f) * acc1[1]) * sc8[0] +
+                                         (acc1[2] + (1.f/256.f) * acc1[3]) * sc8[1] * (1.f/16.f) +
+                                         (acc2[0] + (1.f/256.f) * acc2[1]) * sc8[4] +
+                                         (acc2[2] + (1.f/256.f) * acc2[3]) * sc8[5] * (1.f/16.f)) -
+                      float(xu[ib].dmin) * (sumy[0] * sc8[2] + sumy[1] * sc8[3] + sumy[2] * sc8[6] + sumy[3] * sc8[7]);
+        }
+        y4 += 4 * QK_K;
+    }
+
+    const float g = simd_sum(sg_acc);
+    const float u = simd_sum(su_acc);
+    if (lane == 0u) {
+        situ[(uint64_t)tgpig.y * args.n_ff + row] = inkling_apply_situ(g, u, args);
+    }
+}
+
+// --- 3. gate_up + SiTU: IQ2_XXS (direct per-slot, NR0=2 pairs = 4 rows/sg matching N_R0_IQ2_XXS=4, cached yl[32]) ---
+kernel void kernel_inkling_moe_gate_up_situ_iq2_xxs(
+        constant inkling_moe_gu_args & args    [[buffer(0)]],
+        device const char            * weights [[buffer(1)]],
+        device const char            * x       [[buffer(2)]],
+        device const int32_t         * ids     [[buffer(3)]],
+        device       float           * situ    [[buffer(4)]],
+        threadgroup  char            * shmem   [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup uint64_t * svalues = (threadgroup uint64_t *)shmem;
+    threadgroup uint8_t  * ssigns  = (threadgroup uint8_t  *)(svalues + 256);
+    {
+        const uint32_t tid = 32u * sg + lane;
+        svalues[2u * tid + 0u] = iq2xxs_grid[2u * tid + 0u];
+        svalues[2u * tid + 1u] = iq2xxs_grid[2u * tid + 1u];
+        ssigns[tid] = ksigns_iq2xs[tid];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t first_row = (tgpig.x * 4u + sg) * 2u;
+    if (first_row >= args.n_ff) { return; }
+
+    const int nb32 = int(args.n_embd / 32u);
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_iq2_xxs * rows[4] = {
+        (device const block_iq2_xxs *)(e_base + (uint64_t)(first_row + 0u) * args.nb01),
+        (device const block_iq2_xxs *)(e_base + (uint64_t)(first_row + 1u) * args.nb01),
+        (device const block_iq2_xxs *)(e_base + (uint64_t)(first_row + args.n_ff + 0u) * args.nb01),
+        (device const block_iq2_xxs *)(e_base + (uint64_t)(first_row + args.n_ff + 1u) * args.nb01),
+    };
+    device const float * y4 = (device const float *)(x + (uint64_t)tok * args.nb12) + 32 * lane;
+
+    float yl[32];
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    for (int ib32 = int(lane); ib32 < nb32; ib32 += 32) {
+        for (short i = 0; i < 32; ++i) { yl[i] = y4[i]; }
+        const int ibl = ib32 / (QK_K / 32);
+        const int ib  = ib32 % (QK_K / 32);
+        FOR_UNROLL (short r = 0; r < 4; ++r) {
+            device const block_iq2_xxs & xr = rows[r][ibl];
+            device const uint16_t * q2 = xr.qs + 4 * ib;
+            device const uint8_t * aux8 = (device const uint8_t *)q2;
+            const uint32_t aux32 = q2[2] | (q2[3] << 16);
+            const float d = float(xr.d) * (0.5f + (aux32 >> 28));
+            float sum = 0.0f;
+            for (short l = 0; l < 4; ++l) {
+                const threadgroup uint8_t * grid = (const threadgroup uint8_t *)(svalues + aux8[l]);
+                const uint8_t signs = ssigns[(aux32 >> (7*l)) & 127];
+                for (short j = 0; j < 8; ++j) {
+                    sum += yl[8*l + j] * float(grid[j]) * ((signs & kmask_iq2xs[j]) ? -1.f : 1.f);
+                }
+            }
+            sumf[r] += d * sum;
+        }
+        y4 += 32 * 32;
+    }
+    const float g0 = simd_sum(sumf[0]) * 0.25f;
+    const float g1 = simd_sum(sumf[1]) * 0.25f;
+    const float u0 = simd_sum(sumf[2]) * 0.25f;
+    const float u1 = simd_sum(sumf[3]) * 0.25f;
+    if (lane == 0u) {
+        device float * dst = situ + (uint64_t)tgpig.y * args.n_ff;
+        dst[first_row + 0u] = inkling_apply_situ(g0, u0, args);
+        dst[first_row + 1u] = inkling_apply_situ(g1, u1, args);
+    }
+}
+
+// --- 4. Direct per-slot down: Q4_0 and Q5_0 (NR0=4 always, zero plan barrier) ---
+template<typename block_q_type>
+kernel void kernel_inkling_moe_down_q45(
+        constant inkling_moe_down_args & args    [[buffer(0)]],
+        device const char              * weights [[buffer(1)]],
+        device const float             * situ    [[buffer(2)]],
+        device const int32_t           * ids     [[buffer(3)]],
+        device       float             * dst     [[buffer(4)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    if (first_row >= args.n_embd) { return; }
+
+    const int nb = int(args.n_ff / QK4_0);
+    const short ix = lane / 2;
+    const short il = (lane % 2) * 8;
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_q_type * ax[4];
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        ax[r] = (device const block_q_type *)(e_base + (uint64_t)(first_row + r) * args.nb01);
+    }
+    device const float * yb = situ + (uint64_t)tgpig.y * args.n_ff + ix * QK4_0 + il;
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    float yl[16];
+    for (int ib = ix; ib < nb; ib += 16) {
+        float sumy = 0.0f;
+        FOR_UNROLL (short i = 0; i < 8; i += 2) {
+            sumy     += yb[i + 0] + yb[i + 1] + yb[i + 16] + yb[i + 17];
+            yl[i + 0] = yb[i + 0];
+            yl[i + 1] = yb[i + 1]  * (1.0f / 256.0f);
+            yl[i + 8] = yb[i + 16] * (1.0f / 16.0f);
+            yl[i + 9] = yb[i + 17] * (1.0f / 4096.0f);
+        }
+        FOR_UNROLL (short r = 0; r < 4; ++r) {
+            sumf[r] += block_q_n_dot_y(ax[r] + ib, sumy, yl, il);
+        }
+        yb += QK4_0 * 16;
+    }
+    device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0u && first_row + r < args.n_embd) { drow[first_row + r] = tot; }
+    }
+}
+
+template [[host_name("kernel_inkling_moe_down_q4_0")]] kernel void kernel_inkling_moe_down_q45<block_q4_0>(constant inkling_moe_down_args &, device const char *, device const float *, device const int32_t *, device float *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_moe_down_q5_0")]] kernel void kernel_inkling_moe_down_q45<block_q5_0>(constant inkling_moe_down_args &, device const char *, device const float *, device const int32_t *, device float *, uint2, ushort, ushort);
+
+// --- 5. Direct per-slot down: Q2_0 (NR0=4 always) ---
+kernel void kernel_inkling_moe_down_q2_0(
+        constant inkling_moe_down_args & args    [[buffer(0)]],
+        device const char              * weights [[buffer(1)]],
+        device const float             * situ    [[buffer(2)]],
+        device const int32_t           * ids     [[buffer(3)]],
+        device       float             * dst     [[buffer(4)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    if (first_row >= args.n_embd) { return; }
+
+    const int nb = int(args.n_ff / QK2_0);
+    const short ix = lane / 4;
+    const short il = (lane % 4) * 16;
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_q2_0 * ax[4];
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        ax[r] = (device const block_q2_0 *)(e_base + (uint64_t)(first_row + r) * args.nb01);
+    }
+    device const float * yb = situ + (uint64_t)tgpig.y * args.n_ff + ix * QK2_0 + il;
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    float yl[16];
+    for (int ib = ix; ib < nb; ib += 8) {
+        float sumy = 0.0f;
+        FOR_UNROLL (short i = 0; i < 16; ++i) { yl[i] = yb[i]; sumy += yb[i]; }
+        FOR_UNROLL (short r = 0; r < 4; ++r) { sumf[r] += block_q_n_dot_y(ax[r] + ib, sumy, yl, il); }
+        yb += QK2_0 * 8;
+    }
+    device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0u && first_row + r < args.n_embd) { drow[first_row + r] = tot; }
+    }
+}
+
+// --- 6. Direct per-slot down: IQ4_NL (NR0=4 always) ---
+kernel void kernel_inkling_moe_down_iq4_nl(
+        constant inkling_moe_down_args & args    [[buffer(0)]],
+        device const char              * weights [[buffer(1)]],
+        device const float             * situ    [[buffer(2)]],
+        device const int32_t           * ids     [[buffer(3)]],
+        device       float             * dst     [[buffer(4)]],
+        threadgroup  char              * shmem   [[threadgroup(0)]],
+        uint2  tgpig [[threadgroup_position_in_grid]],
+        ushort lane  [[thread_index_in_simdgroup]],
+        ushort sg    [[simdgroup_index_in_threadgroup]]) {
+    threadgroup float * lut = (threadgroup float *)shmem;
+    if (sg == 0u && lane < 16u) { lut[lane] = kvalues_iq4nl_f[lane]; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    const uint32_t first_row = (tgpig.x * 4u + sg) * 4u;
+    if (first_row >= args.n_embd) { return; }
+
+    const int nb = int(args.n_ff / QK4_NL);
+    const short ix = lane / 2;
+    const short it = lane % 2;
+    device const char * e_base = weights + (uint64_t)expert_id * args.nb02;
+    device const block_iq4_nl * ax[4];
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        ax[r] = (device const block_iq4_nl *)(e_base + (uint64_t)(first_row + r) * args.nb01);
+    }
+    device const float * yb = situ + (uint64_t)tgpig.y * args.n_ff + ix * QK4_NL + it * 8;
+    float sumf[4] = { 0.f, 0.f, 0.f, 0.f };
+    for (int ib = ix; ib < nb; ib += 16) {
+        device const float4 * y4 = (device const float4 *)yb;
+        const float4 yl0 = y4[0], yl1 = y4[4], yl2 = y4[1], yl3 = y4[5];
+        FOR_UNROLL (short r = 0; r < 4; ++r) {
+            device const block_iq4_nl & xb = ax[r][ib];
+            device const uint16_t * q4 = (device const uint16_t *)(xb.qs + 8 * it);
+            uint32_t aux32[2];
+            thread const uint8_t * q8 = (thread const uint8_t *)aux32;
+            aux32[0] = q4[0] | (q4[1] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0fu;
+            aux32[0] &= 0x0f0f0f0fu;
+            const float4 qf0 = { lut[q8[0]], lut[q8[1]], lut[q8[2]], lut[q8[3]] };
+            const float4 qf1 = { lut[q8[4]], lut[q8[5]], lut[q8[6]], lut[q8[7]] };
+            aux32[0] = q4[2] | (q4[3] << 16);
+            aux32[1] = (aux32[0] >> 4) & 0x0f0f0f0fu;
+            aux32[0] &= 0x0f0f0f0fu;
+            const float4 qf2 = { lut[q8[0]], lut[q8[1]], lut[q8[2]], lut[q8[3]] };
+            const float4 qf3 = { lut[q8[4]], lut[q8[5]], lut[q8[6]], lut[q8[7]] };
+            sumf[r] += float(xb.d) * (dot(yl0, qf0) + dot(yl1, qf1) + dot(yl2, qf2) + dot(yl3, qf3));
+        }
+        yb += 16 * QK4_NL;
+    }
+    device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+    FOR_UNROLL (short r = 0; r < 4; ++r) {
+        const float tot = simd_sum(sumf[r]);
+        if (lane == 0u && first_row + r < args.n_embd) { drow[first_row + r] = tot; }
+    }
+}

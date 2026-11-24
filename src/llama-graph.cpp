@@ -2679,6 +2679,42 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
                 return combined;
             }
         }
+        // Resident Metal fused direct per-slot MoE FFN (gate_up + SiTU + down):
+        // M = 1..11 for Q4_0, M = 1..7 for Q4_K/IQ2_XXS (where mul_mm_id takes over at M >= 8).
+        const int64_t moe_max_tokens = (gate_up_exps && gate_up_exps->type == GGML_TYPE_Q4_0) ? 11 : 7;
+        if (!expert_executor && !cparams.cb_eval && arch == LLM_ARCH_INKLING2_LOOP && type_op == LLM_FFN_SITU && !mm_ids &&
+                gate_up_exps && down_exps && !gate_up_exps_b && !up_exps_s && !gate_exps_s && !down_exps_s &&
+                loras->empty() && n_tokens >= 1 && n_tokens <= moe_max_tokens &&
+                (!hdmd || (!hdmd->rot.count(gate_up_exps) && !hdmd->rot.count(down_exps))) &&
+                prec_policy.prec_acc.empty() && prec_policy.prec_src1.empty() &&
+                model.dev_output() && std::strcmp(ggml_backend_dev_name(model.dev_output()), "MTL0") == 0 &&
+                model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all) {
+            const char * fused_env = std::getenv("LLAMA_INKLING_FUSED_KERNELS");
+            const char * moe_env   = std::getenv("LLAMA_INKLING_FUSED_MOE");
+            if ((!fused_env || std::strcmp(fused_env, "0") != 0) &&
+                    (!moe_env || std::strcmp(moe_env, "0") != 0)) {
+                const auto reg = ggml_backend_dev_backend_reg(model.dev_output());
+                const auto moe_fn = reinterpret_cast<ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *,
+                        ggml_tensor *, ggml_tensor *, float, float)>(
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_moe_ffn_v1"));
+                if (moe_fn) {
+                    if (auto * combined = moe_fn(ctx0, cur, ids, gate_up_exps, down_exps,
+                            hparams.situ_beta, hparams.situ_linear_beta)) {
+                        for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                            auto backend = ggml_backend_sched_get_backend(sched, i);
+                            if (ggml_backend_get_device(backend) == model.dev_output()) {
+                                if (ggml_backend_supports_op(backend, combined)) {
+                                    ggml_backend_sched_set_tensor_backend(sched, combined, backend);
+                                    cb(combined, "ffn_moe_down", il);
+                                    return combined;
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
         // A private streaming capability owns the complete routed FP32 FFN.
         // Keep router, shared FFN, weighting and reduction in the original graph.
         if (expert_executor && ((expert_executor->combined_moe_enabled() && n_outputs == ubatch.n_tokens) ||

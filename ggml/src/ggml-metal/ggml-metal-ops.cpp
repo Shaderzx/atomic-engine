@@ -502,6 +502,92 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.channels + threads - 1u) / threads, n_seqs, 1, threads, 1, 1);
                     break;
                 }
+                if (tag == GGML_METAL_INKLING_MOE_FFN) {
+                    const ggml_tensor * cur     = node->src[0]; // [n_embd, 1, n_tokens]
+                    const ggml_tensor * ids     = node->src[1]; // [8, n_tokens]
+                    const ggml_tensor * gate_up = node->src[2]; // [n_embd, 2*n_ff, n_experts]
+                    const ggml_tensor * down    = node->src[3]; // [n_ff, n_embd, n_experts]
+
+                    const uint32_t n_embd     = (uint32_t)cur->ne[0];
+                    const uint32_t n_ff       = (uint32_t)(gate_up->ne[1] / 2);
+                    const uint32_t n_tokens   = (uint32_t)node->ne[2];
+                    const uint32_t ids_stride = (uint32_t)(ids->nb[1] / sizeof(int32_t));
+                    const float beta          = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3);
+                    const float linear_beta   = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
+
+                    const char * gu_name = gate_up->type == GGML_TYPE_Q4_0    ? "kernel_inkling_moe_gate_up_situ_q4_0"
+                                         : gate_up->type == GGML_TYPE_Q4_K    ? "kernel_inkling_moe_gate_up_situ_q4_K"
+                                                                              : "kernel_inkling_moe_gate_up_situ_iq2_xxs";
+                    const char * dn_name = down->type == GGML_TYPE_Q4_0       ? "kernel_inkling_moe_down_q4_0"
+                                         : down->type == GGML_TYPE_Q5_0       ? "kernel_inkling_moe_down_q5_0"
+                                         : down->type == GGML_TYPE_Q2_0       ? "kernel_inkling_moe_down_q2_0"
+                                                                              : "kernel_inkling_moe_down_iq4_nl";
+                    auto get_pipe = [&](const char * kname) {
+                        auto p = ggml_metal_library_get_pipeline(ctx->lib, kname);
+                        if (!p.pipeline) { p = ggml_metal_library_compile_pipeline(ctx->lib, kname, kname, nullptr); }
+                        GGML_ASSERT(p.pipeline);
+                        return p;
+                    };
+
+                    ggml_metal_buffer_id bid_dst  = ggml_metal_get_buffer_id(node);
+                    ggml_metal_buffer_id bid_situ = bid_dst;
+                    bid_situ.offs += GGML_PAD(ggml_nbytes(node), 64);
+
+                    ggml_metal_buffer_id bid_cur  = ggml_metal_get_buffer_id(cur);
+                    ggml_metal_buffer_id bid_ids  = ggml_metal_get_buffer_id(ids);
+                    ggml_metal_buffer_id bid_gu   = ggml_metal_get_buffer_id(gate_up);
+                    ggml_metal_buffer_id bid_dn   = ggml_metal_get_buffer_id(down);
+
+                    // Direct per-slot dispatch (zero plan barrier, zero hot-expert tail imbalance, full NR0=4 reuse).
+                    const uint32_t n_slots = 8u * n_tokens;
+
+                    {
+                        auto p_gu = get_pipe(gu_name);
+                        struct {
+                            uint32_t n_embd, n_ff, n_tokens, ids_stride;
+                            uint64_t nb01, nb02, nb12;
+                            float    beta, inv_beta, linear_beta, inv_linear_beta;
+                        } gu_args = {
+                            n_embd, n_ff, n_tokens, ids_stride,
+                            (uint64_t)gate_up->nb[1], (uint64_t)gate_up->nb[2], (uint64_t)cur->nb[2],
+                            beta, 1.0f / beta, linear_beta, linear_beta > 0.0f ? 1.0f / linear_beta : 0.0f,
+                        };
+                        ggml_metal_encoder_set_pipeline(ctx->enc, p_gu);
+                        ggml_metal_encoder_set_bytes(ctx->enc, &gu_args, sizeof(gu_args), 0);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_gu,   1);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_cur,  2);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_ids,  3);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_situ, 4);
+                        if (gate_up->type == GGML_TYPE_IQ2_XXS) {
+                            ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 2240, 0);
+                        }
+                        const uint32_t rows_per_tg = gate_up->type == GGML_TYPE_Q4_K ? 4u : 8u;
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_ff + rows_per_tg - 1u) / rows_per_tg, n_slots, 1, 32, 4, 1);
+                        ggml_metal_op_concurrency_reset(ctx);
+                    }
+
+                    {
+                        auto p_dn = get_pipe(dn_name);
+                        struct {
+                            uint32_t n_ff, n_embd, n_tokens, ids_stride;
+                            uint64_t nb01, nb02;
+                        } dn_args = {
+                            n_ff, n_embd, n_tokens, ids_stride,
+                            (uint64_t)down->nb[1], (uint64_t)down->nb[2],
+                        };
+                        ggml_metal_encoder_set_pipeline(ctx->enc, p_dn);
+                        ggml_metal_encoder_set_bytes(ctx->enc, &dn_args, sizeof(dn_args), 0);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_dn,   1);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_situ, 2);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_ids,  3);
+                        ggml_metal_encoder_set_buffer(ctx->enc, bid_dst,  4);
+                        if (down->type == GGML_TYPE_IQ4_NL) {
+                            ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, 64, 0);
+                        }
+                        ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_embd + 15u) / 16u, n_slots, 1, 32, 4, 1);
+                    }
+                    break;
+                }
                 if (tag == GGML_METAL_INKLING_CTRL_DOWN) {
                     const char * kernel = "kernel_inkling_ctrl_down_q8_0";
                     auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);

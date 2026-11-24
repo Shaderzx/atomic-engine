@@ -346,6 +346,10 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                         (size_t) tensor->src[0]->ne[2] * GGML_METAL_INKLING_FA_SPLIT_STRIDE * sizeof(float);
                 } else if (tag == GGML_METAL_INKLING_DSPARK_ARGMAX) {
                     res = GGML_PAD(res, 16) + 256u * 2u * sizeof(uint32_t);
+                } else if (tag == GGML_METAL_INKLING_MOE_FFN && tensor->src[2]) {
+                    const size_t n_ff = (size_t)(tensor->src[2]->ne[1] / 2);
+                    res = GGML_PAD(res, 64) +
+                        n_ff * 8u * (size_t)tensor->ne[2] * sizeof(float);
                 }
             } break;
         default:
@@ -1435,6 +1439,43 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx
     return ggml_backend_metal_inkling_flash_attn_v2(ctx, q, k, v, table, sinks, q_pos, k_pos, nullptr, scale, extent, n_swa);
 }
 
+static ggml_tensor * ggml_backend_metal_inkling_moe_ffn_v1(ggml_context * ctx,
+        ggml_tensor * cur, ggml_tensor * ids, ggml_tensor * gate_up, ggml_tensor * down,
+        float beta, float linear_beta) {
+    if (!cur || !ids || !gate_up || !down ||
+            !std::isfinite(beta) || beta <= 0.0f || !std::isfinite(linear_beta) || linear_beta < 0.0f ||
+            cur->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+            !ggml_is_contiguous(cur) || !ggml_is_contiguous(gate_up) || !ggml_is_contiguous(down) ||
+            !ggml_is_matrix(ids) || ids->nb[0] != sizeof(int32_t) || (ids->nb[1] % sizeof(int32_t)) != 0 ||
+            cur->ne[1] != 1 || cur->ne[3] != 1 ||
+            ids->ne[0] != 8 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
+            cur->ne[2] != ids->ne[1] ||
+            gate_up->ne[0] != cur->ne[0] || (gate_up->ne[0] % 256) != 0 ||
+            (gate_up->ne[1] % 8) != 0 || gate_up->ne[1] <= 0 ||
+            gate_up->ne[2] < 8 || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
+            down->ne[0] != gate_up->ne[1] / 2 || (down->ne[0] % 64) != 0 ||
+            down->ne[1] != cur->ne[0] || (down->ne[1] % 4) != 0 ||
+            down->ne[2] != gate_up->ne[2] || down->ne[3] != 1) {
+        return nullptr;
+    }
+    const bool gu_ok = gate_up->type == GGML_TYPE_Q4_0 ||
+                       gate_up->type == GGML_TYPE_Q4_K ||
+                       gate_up->type == GGML_TYPE_IQ2_XXS;
+    const bool dn_ok = down->type == GGML_TYPE_Q4_0 ||
+                       down->type == GGML_TYPE_Q5_0 ||
+                       down->type == GGML_TYPE_Q2_0 ||
+                       down->type == GGML_TYPE_IQ4_NL;
+    if (!gu_ok || !dn_ok) { return nullptr; }
+    ggml_tensor * args[] = { cur, ids, gate_up, down };
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], 8, ids->ne[1], 1, args, 4,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused MoE FFN requires Metal"); }, 1, nullptr);
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3, beta);
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, linear_beta);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_MOE_FFN;
+    ggml_set_name(node, "inkling_moe_ffn");
+    return node;
+}
+
 static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v2(ggml_context * ctx,
         ggml_tensor * cur, ggml_tensor * weights, ggml_tensor * history, ggml_tensor * state,
         ggml_tensor * dynamic, ggml_tensor * residual, ggml_tensor * exp_weights,
@@ -1622,6 +1663,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_conv_fused_v2") == 0) {
         return (void *) ggml_backend_metal_inkling_conv_fused_v2;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_moe_ffn_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_moe_ffn_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_ctrl_down_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_ctrl_down_v1;

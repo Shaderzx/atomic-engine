@@ -28,6 +28,7 @@ using conv_fused_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tens
         ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float);
 using conv_fused_v2_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
         ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float);
+using moe_ffn_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, float);
 using ctrl_down_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 using ctrl_apply_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 using mul_sigmoid_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *);
@@ -57,7 +58,8 @@ static void quantize_and_dequant(ggml_type type, const std::vector<float> & src,
         ggml_fp32_to_bf16_row(src.data(), reinterpret_cast<ggml_bf16_t *>(qbytes.data()), n_rows * n_cols);
         ggml_bf16_to_fp32_row(reinterpret_cast<const ggml_bf16_t *>(qbytes.data()), ref_f32.data(), n_rows * n_cols);
     } else {
-        ggml_quantize_chunk(type, src.data(), qbytes.data(), 0, n_rows, n_cols, nullptr);
+        std::vector<float> imat((size_t) n_cols, 1.0f);
+        ggml_quantize_chunk(type, src.data(), qbytes.data(), 0, n_rows, n_cols, imat.data());
         for (int64_t r = 0; r < n_rows; ++r) {
             traits->to_float(qbytes.data() + (size_t) r * row_bytes, ref_f32.data() + (size_t) r * (size_t) n_cols, n_cols);
         }
@@ -957,6 +959,104 @@ int main(int argc, char ** argv) {
             }
             t.assert_true(max_abs_diff(got_out, ref_out) < 1e-5f);
             t.assert_true(max_abs_diff(got_state, state_ref) < 1e-5f);
+        }
+    });
+
+    t.test("inkling_moe_ffn_v1 coalesced parity across Q4_0/Q4_K/IQ2_XXS + Q4_0/Q5_0/Q2_0/IQ4_NL (M=1 & M=6)", [&](testing & t) {
+        auto create = reinterpret_cast<moe_ffn_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_moe_ffn_v1"));
+        t.assert_true(create != nullptr);
+
+        const int64_t n_embd = 256, n_ff = 128, n_exp = 16;
+        const float beta = 2.0f, linear_beta = 4.0f;
+        const std::vector<std::pair<ggml_type, ggml_type>> combos = {
+            { GGML_TYPE_Q4_0,    GGML_TYPE_Q4_0   },
+            { GGML_TYPE_Q4_K,    GGML_TYPE_Q5_0   },
+            { GGML_TYPE_IQ2_XXS, GGML_TYPE_Q2_0   },
+            { GGML_TYPE_IQ2_XXS, GGML_TYPE_IQ4_NL },
+        };
+
+        for (auto [gu_type, dn_type] : combos) {
+            auto gu_raw = rand_vec(n_embd * (2 * n_ff) * n_exp, 901, -0.3f, 0.3f);
+            auto dn_raw = rand_vec(n_ff * n_embd * n_exp, 902, -0.3f, 0.3f);
+            std::vector<uint8_t> gu_bytes, dn_bytes;
+            std::vector<float> gu_ref, dn_ref;
+            quantize_and_dequant(gu_type, gu_raw, (2 * n_ff) * n_exp, n_embd, gu_bytes, gu_ref);
+            quantize_and_dequant(dn_type, dn_raw, n_embd * n_exp, n_ff, dn_bytes, dn_ref);
+
+            for (int64_t n_tok : {1, 6}) {
+                auto x_v = rand_vec(n_embd * n_tok, 910 + (uint32_t)n_tok, -1.0f, 1.0f);
+                // Construct realistic routes with heavy duplicate experts across tokens (e.g. expert 0 hit 6 times, expert 3 hit 4 times, etc.)
+                std::vector<int32_t> ids_v(8 * n_tok);
+                for (int64_t tok = 0; tok < n_tok; ++tok) {
+                    ids_v[tok * 8 + 0] = 0;
+                    ids_v[tok * 8 + 1] = 3;
+                    ids_v[tok * 8 + 2] = (int32_t)((tok % 3) + 1);
+                    ids_v[tok * 8 + 3] = (int32_t)((tok + 4) % n_exp);
+                    ids_v[tok * 8 + 4] = (int32_t)((tok * 2 + 5) % n_exp);
+                    ids_v[tok * 8 + 5] = (int32_t)((tok + 8) % n_exp);
+                    ids_v[tok * 8 + 6] = (int32_t)((tok % 2) + 12);
+                    ids_v[tok * 8 + 7] = 15;
+                    // Ensure 8 distinct experts per token (top-8 invariant)
+                    std::vector<bool> used(n_exp, false);
+                    for (int k = 0; k < 8; ++k) {
+                        int32_t e = ids_v[tok * 8 + k];
+                        while (used[e]) { e = (e + 1) % (int32_t)n_exp; }
+                        used[e] = true;
+                        ids_v[tok * 8 + k] = e;
+                    }
+                }
+
+                ggml_context_ptr ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
+                auto * tx   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, n_tok);
+                auto * tids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 8, n_tok);
+                auto * tgu  = ggml_new_tensor_3d(ctx.get(), gu_type, n_embd, 2 * n_ff, n_exp);
+                auto * tdn  = ggml_new_tensor_3d(ctx.get(), dn_type, n_ff, n_embd, n_exp);
+                auto * out  = create(ctx.get(), tx, tids, tgu, tdn, beta, linear_beta);
+                t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+                std::vector<float> got(n_embd * 8 * n_tok);
+                run_graph(ctx.get(), out, {
+                    {tx,   {x_v.data(),      x_v.size() * sizeof(float)}},
+                    {tids, {ids_v.data(),    ids_v.size() * sizeof(int32_t)}},
+                    {tgu,  {gu_bytes.data(), gu_bytes.size()}},
+                    {tdn,  {dn_bytes.data(), dn_bytes.size()}},
+                }, got.data(), got.size() * sizeof(float));
+
+                // Pure CPU F32 reference
+                std::vector<float> ref(n_embd * 8 * n_tok, 0.0f);
+                std::vector<float> h(n_ff);
+                for (int64_t tok = 0; tok < n_tok; ++tok) {
+                    const float * xp = x_v.data() + tok * n_embd;
+                    for (int64_t k = 0; k < 8; ++k) {
+                        const int64_t e = ids_v[tok * 8 + k];
+                        const float * gup = gu_ref.data() + e * (2 * n_ff) * n_embd;
+                        for (int64_t r = 0; r < n_ff; ++r) {
+                            double g = 0.0, u = 0.0;
+                            const float * wg = gup + r * n_embd;
+                            const float * wu = gup + (r + n_ff) * n_embd;
+                            for (int64_t i = 0; i < n_embd; ++i) {
+                                g += (double)wg[i] * (double)xp[i];
+                                u += (double)wu[i] * (double)xp[i];
+                            }
+                            const float gf = (float)g, uf = (float)u;
+                            const float act = (beta * std::tanh(gf / beta)) * (1.0f / (1.0f + std::exp(-gf))) *
+                                    (linear_beta * std::tanh(uf / linear_beta));
+                            h[r] = act;
+                        }
+                        const float * dnp = dn_ref.data() + e * n_embd * n_ff;
+                        float * dp = ref.data() + (tok * 8 + k) * n_embd;
+                        for (int64_t r = 0; r < n_embd; ++r) {
+                            double acc = 0.0;
+                            const float * wd = dnp + r * n_ff;
+                            for (int64_t i = 0; i < n_ff; ++i) { acc += (double)wd[i] * (double)h[i]; }
+                            dp[r] = (float)acc;
+                        }
+                    }
+                }
+                const float diff = max_abs_diff(got, ref);
+                t.assert_true(diff < 5e-4f);
+            }
         }
     });
 
