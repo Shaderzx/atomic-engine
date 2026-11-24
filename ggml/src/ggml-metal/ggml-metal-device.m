@@ -1677,7 +1677,8 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     if (!w2 || !w2_b || !base || !lat) { return false; }
                     const bool w2_ok = w2->type == GGML_TYPE_Q8_0 || (w2->type == GGML_TYPE_BF16 && dev->props.has_bfloat);
                     const bool sl_ok = !sl || (sl->type == GGML_TYPE_I32 && ggml_is_contiguous(sl) && ggml_nelements(sl) == w2->ne[1]);
-                    return w2_ok && sl_ok &&
+                    return op->type == GGML_TYPE_I32 && ggml_nelements(op) >= 2 &&
+                           w2_ok && sl_ok &&
                            ggml_is_contiguous(w2) && w2->ne[0] > 0 && w2->ne[0] <= 512 && (w2->ne[0] % 32) == 0 && w2->ne[1] > 0 &&
                            w2_b->type == GGML_TYPE_F32 && ggml_is_contiguous(w2_b) && ggml_nelements(w2_b) == w2->ne[1] &&
                            base->type == GGML_TYPE_F32 && ggml_is_contiguous(base) && ggml_nelements(base) == w2->ne[1] &&

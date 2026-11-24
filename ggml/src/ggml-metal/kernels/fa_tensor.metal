@@ -414,6 +414,7 @@ kernel void kernel_inkling_fa_tensor_impl(
     int   my_min_qp = INT_MAX;
     int   my_max_qp = INT_MIN;
     ulong my_seq_mask = 0ULL;
+    int   my_seq_invalid = 0;
 
     FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
         const uint j = (uint)(jj * NSG + sgitg);
@@ -422,6 +423,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             const int qp = q_pos[q_idx * 2u];
             const uint qseq = (uint)q_pos[q_idx * 2u + 1u];
             const ulong qbit = qseq < 64u ? (1ULL << qseq) : 0ULL;
+            if (qseq >= 64u) { my_seq_invalid = 1; }
             qpos_r[jj] = qp;
             qbit_r[jj] = qbit;
             my_seq_mask |= qbit;
@@ -442,16 +444,18 @@ kernel void kernel_inkling_fa_tensor_impl(
     }
 
     if (tiisg == 0) {
-        kpos_tg[sgitg]     = my_min_qp;
-        kpos_tg[sgitg + 4] = my_max_qp;
-        kseq_tg[sgitg]     = my_seq_mask;
+        kpos_tg[sgitg]      = my_min_qp;
+        kpos_tg[sgitg + 4]  = my_max_qp;
+        kpos_tg[sgitg + 8]  = my_seq_invalid;
+        kseq_tg[sgitg]      = my_seq_mask;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const int   tg_min_qp     = min(min(kpos_tg[0], kpos_tg[1]), min(kpos_tg[2], kpos_tg[3]));
     const int   tg_max_qp     = max(max(kpos_tg[4], kpos_tg[5]), max(kpos_tg[6], kpos_tg[7]));
+    const bool  tg_any_inval  = (kpos_tg[8] | kpos_tg[9] | kpos_tg[10] | kpos_tg[11]) != 0;
     const ulong tg_seq_mask   = kseq_tg[0] | kseq_tg[1] | kseq_tg[2] | kseq_tg[3];
-    const bool  tg_single_seq = (tg_seq_mask != 0ULL) && ((tg_seq_mask & (tg_seq_mask - 1ULL)) == 0ULL);
+    const bool  tg_single_seq = !tg_any_inval && (tg_seq_mask != 0ULL) && ((tg_seq_mask & (tg_seq_mask - 1ULL)) == 0ULL);
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 

@@ -460,10 +460,14 @@ kernel void kernel_inkling_dspark_argmax_s2(
 
     if (tid == 0) {
         if (sh[0].idx < args.vocab) {
-            dst[0] = args.has_shortlist ? shortlist_ids[sh[0].idx] : int(sh[0].idx);
+            const int tok = args.has_shortlist ? shortlist_ids[sh[0].idx] : int(sh[0].idx);
+            dst[0] = tok;
+            dst[1] = max(tok, 0);
         } else {
-            // No finite candidate (e.g. all-NaN logits): signal invalid token to stop drafting.
+            // No finite candidate (e.g. all-NaN logits): dst[0] = -1 tells the host to stop drafting,
+            // while dst[1] = 0 provides a safe in-bounds row index for any chained ggml_get_rows step.
             dst[0] = -1;
+            dst[1] = 0;
         }
     }
 }

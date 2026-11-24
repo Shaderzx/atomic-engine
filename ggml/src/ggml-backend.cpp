@@ -13,6 +13,7 @@
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
+#include "ggml-metal/ggml-metal-expert.h"
 
 #include <assert.h>
 #include <limits.h>
@@ -250,7 +251,7 @@ size_t ggml_backend_buft_get_alloc_size(ggml_backend_buffer_type_t buft, const s
                 : 0;
         const bool inkling_custom_tail_scratch =
                 tensor->op == GGML_OP_CUSTOM &&
-                (custom_tag == 0x4154453A || custom_tag == 0x4154453E);
+                (custom_tag == GGML_METAL_INKLING_FLASH_ATTN || custom_tag == GGML_METAL_INKLING_DSPARK_ARGMAX);
         GGML_ASSERT(size <= ggml_nbytes(tensor) ||
                     ggml_op_is_empty(tensor->op) ||
                     ggml_is_quantized(tensor->type) || // [TAG_ALLOC_SIZE_EXPAND]

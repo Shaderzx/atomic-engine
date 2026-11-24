@@ -2061,7 +2061,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        gf = model.build_graph(gparams);
+        try {
+            gf = model.build_graph(gparams);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: failed to build graph: %s\n", __func__, e.what());
+            ret = GGML_STATUS_ALLOC_FAILED;
+            return nullptr;
+        }
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
 
@@ -3483,7 +3489,19 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    auto * gf = model.build_graph(gparams);
+    ggml_cgraph * gf = nullptr;
+    try {
+        gf = model.build_graph(gparams);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: failed to build graph: %s\n", __func__, e.what());
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
+    if (!gf) {
+        LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+        this->n_outputs = save_n_outputs;
+        return nullptr;
+    }
 
     // check the graph before scheduling: cross-backend copies break the producer chain that the check follows
     if (!hadamard_verified && gf && (!model.hdmd.rot.empty() || !model.hdmd.inv.empty())) {
@@ -4811,7 +4829,17 @@ void llama_context::opt_epoch_iter(
             gf_res_prev_active = nullptr;
             res->reset();
 
-            auto * gf = model.build_graph(gparams);
+            ggml_cgraph * gf = nullptr;
+            try {
+                gf = model.build_graph(gparams);
+            } catch (const std::exception & e) {
+                LLAMA_LOG_ERROR("%s: failed to build graph: %s\n", __func__, e.what());
+                break;
+            }
+            if (!gf) {
+                LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
+                break;
+            }
 
             struct ggml_context * ctx_compute_opt;
             {

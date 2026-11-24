@@ -66,7 +66,7 @@ def stop_server(proc, fp):
     if fp:
         fp.close()
 
-def chat(prompt, max_tokens=48, logprobs=False):
+def chat(prompt, max_tokens=48, logprobs=False, timeout=300):
     body = {
         "model": "inkling-2-mini",
         "messages": [{"role": "user", "content": prompt}],
@@ -80,7 +80,7 @@ def chat(prompt, max_tokens=48, logprobs=False):
         body["top_logprobs"] = 3
     req = urllib.request.Request(BASE + "/v1/chat/completions", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=180) as r:
+    with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read())
 
 def run_panel(prompts, max_tokens=48, logprobs=True):
@@ -93,21 +93,30 @@ def run_panel(prompts, max_tokens=48, logprobs=True):
         lp_items = (ch.get("logprobs") or {}).get("content") or []
         tok0 = lp_items[0]["token"] if lp_items else None
         lp0  = lp_items[0]["logprob"] if lp_items else None
-        out.append({"text": text, "tok0": tok0, "lp0": lp0, "n_toks": len(lp_items), "toks": [x["token"] for x in lp_items]})
+        out.append({
+            "text": text,
+            "tok0": tok0,
+            "lp0": lp0,
+            "n_toks": len(lp_items),
+            "toks": [x["token"] for x in lp_items],
+            "lps": [x["logprob"] for x in lp_items],
+        })
     return out
 
 def compare_panels(name, ref, cand):
     exact_text = sum(a["text"] == b["text"] for a, b in zip(ref, cand))
     tok0_eq    = sum(a["tok0"] == b["tok0"] for a, b in zip(ref, cand))
-    lp_diffs   = [abs(a["lp0"] - b["lp0"]) for a, b in zip(ref, cand) if a["lp0"] is not None and b["lp0"] is not None and a["tok0"] == b["tok0"]]
+    lp_diffs   = []
     tot_toks   = 0
     match_toks = 0
     for a, b in zip(ref, cand):
         n = min(len(a["toks"]), len(b["toks"]))
         tot_toks += n
-        for x, y in zip(a["toks"][:n], b["toks"][:n]):
-            if x == y:
+        for idx in range(n):
+            if a["toks"][idx] == b["toks"][idx]:
                 match_toks += 1
+                if a["lps"][idx] is not None and b["lps"][idx] is not None:
+                    lp_diffs.append(abs(a["lps"][idx] - b["lps"][idx]))
             else:
                 break
     res = {
@@ -116,8 +125,8 @@ def compare_panels(name, ref, cand):
         "exact_text_match": f"{exact_text}/{len(ref)}",
         "first_token_match": f"{tok0_eq}/{len(ref)}",
         "prefix_token_agreement": f"{match_toks}/{tot_toks} ({100.0 * match_toks / max(1, tot_toks):.1f}%)",
-        "max_top1_logprob_diff": round(max(lp_diffs), 6) if lp_diffs else None,
-        "med_top1_logprob_diff": round(statistics.median(lp_diffs), 6) if lp_diffs else None,
+        "max_matched_logprob_diff": round(max(lp_diffs), 6) if lp_diffs else None,
+        "med_matched_logprob_diff": round(statistics.median(lp_diffs), 6) if lp_diffs else None,
     }
     print(json.dumps(res), flush=True)
     return res
@@ -125,8 +134,8 @@ def compare_panels(name, ref, cand):
 def main():
     summary = {}
 
-    # 1. MTL_SHADER_VALIDATION=1 at -c 262144 (F16 KV + DSpark n_max=2) — exercises prefill + split-K decode (nwg=32)
-    print("=== [1/4] MTL_SHADER_VALIDATION=1 at -c 262144 ===", flush=True)
+    # 1. MTL_SHADER_VALIDATION=1 at -c 262144 (F16 KV + DSpark n_max=2) — >32,768 tokens to force nwg=32 split-K decode live
+    print("=== [1/4] MTL_SHADER_VALIDATION=1 at -c 262144 (n_kv > 32768 -> nwg=32) ===", flush=True)
     proc, fp, st = start_server(
         ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2", "--spec-draft-n-ubatch", "512",
          "-c", "262144", "-b", "2048", "-ub", "2048", "-np", "1",
@@ -135,14 +144,17 @@ def main():
         log_path="/tmp/inkling-verify-shaderval.log",
     )
     try:
-        # 2048+ token prompt to hit fa_tensor prefill + split-K decode (nwg=4/16/32)
-        long_p = ("The quick brown fox jumps over the lazy dog. " * 260) + "\nReply with the word: VALIDATED."
-        r1 = chat(long_p, max_tokens=64)
-        r2 = chat(PARITY_PROMPTS[0], max_tokens=96)
+        # >33,000 token prompt so n_kv > 32768 and split-K decode dispatches nwg=32 live under MTL_SHADER_VALIDATION=1
+        long_p = ("The quick brown fox jumps over the lazy dog. " * 3400) + "\nReply with the word: VALIDATED."
+        r1 = chat(long_p, max_tokens=48, timeout=420)
+        n_prompt = r1["usage"]["prompt_tokens"]
+        assert n_prompt > 32768, f"Expected prompt_tokens > 32768 to trigger nwg=32, got {n_prompt}"
+        r2 = chat(PARITY_PROMPTS[0], max_tokens=64, timeout=180)
         summary["shader_validation_256k"] = {
             "ok": True,
             "startup_s": st,
-            "long_prompt_tokens": r1["usage"]["prompt_tokens"],
+            "long_prompt_tokens": n_prompt,
+            "nwg_32_exercised": n_prompt > 32768,
             "short_completion_tokens": r2["usage"]["completion_tokens"],
         }
         print("PASS shader_validation_256k:", json.dumps(summary["shader_validation_256k"]), flush=True)
@@ -178,42 +190,58 @@ def main():
     finally:
         stop_server(proc, fp)
 
-    # 3. Matched Fused ON vs Fused OFF across ALL 3 KV types (f16, q8_0, q4_0) + spec vs nospec
-    print("=== [3/4] Matched Fused ON vs Fused OFF parity across F16, Q8_0, Q4_0 ===", flush=True)
+    # 3. Single-variable controlled parity across ALL 3 KV types (f16, q8_0, q4_0):
+    #    - fused_on_vs_off_nospec_{kv} : fusions ON vs OFF, both nospec
+    #    - fused_on_vs_off_spec_{kv}   : fusions ON vs OFF, both DSpark n_max=2 (matched M=3 verify)
+    #    - spec_vs_nospec_off_{kv}     : upstream batching baseline (M=1 vs M=3, all fusions OFF)
+    #    - spec_vs_nospec_on_{kv}      : fused batching comparison (M=1 vs M=3, all fusions ON)
+    print("=== [3/4] Controlled Fused ON vs Fused OFF parity across F16, Q8_0, Q4_0 ===", flush=True)
     off_env = {
         "LLAMA_INKLING_FUSED_ATTN": "0",
         "LLAMA_INKLING_FUSED_KERNELS": "0",
         "LLAMA_INKLING_FUSED_MIX": "0",
         "LLAMA_INKLING_FUSED_CTRL": "0",
+        "LLAMA_INKLING_DSPARK_FAST": "0",
+        "LLAMA_INKLING_PROMPT_LOOKUP": "0",
     }
     parity_results = []
     for kv in ["f16", "q8_0", "q4_0"]:
         base_args = ["-c", "4096", "-b", "512", "-ub", "512", "-np", "1", "-ctk", kv, "-ctv", kv]
-        # Reference: all custom fusions OFF, nospec
-        proc, fp, _ = start_server(base_args, extra_env=off_env, log_path=f"/tmp/inkling-verify-off-{kv}.log")
+        spec_args = base_args + ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2",
+                                 "--spec-draft-n-ubatch", "512", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"]
+
+        # Reference A: all custom fusions OFF, nospec
+        proc, fp, _ = start_server(base_args, extra_env=off_env, log_path=f"/tmp/inkling-verify-off-nospec-{kv}.log")
         try:
             ref_nospec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
 
-        # Candidate A: all custom fusions ON, nospec (identical KV, -c, -b, -ub)
-        proc, fp, _ = start_server(base_args, log_path=f"/tmp/inkling-verify-on-{kv}.log")
+        # Reference B: all custom fusions OFF, DSpark n_max=2
+        proc, fp, _ = start_server(spec_args, extra_env=off_env, log_path=f"/tmp/inkling-verify-off-spec-{kv}.log")
+        try:
+            ref_spec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
+        finally:
+            stop_server(proc, fp)
+
+        # Candidate A: all custom fusions ON, nospec
+        proc, fp, _ = start_server(base_args, log_path=f"/tmp/inkling-verify-on-nospec-{kv}.log")
         try:
             on_nospec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
-        parity_results.append(compare_panels(f"fused_on_vs_off_nospec_{kv}", ref_nospec, on_nospec))
 
-        # Candidate B: all custom fusions ON + DSpark n_max=2 (exercises M=3 verification, rejection & rollback)
-        spec_args = base_args + ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2",
-                                 "--spec-draft-n-ubatch", "512", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"]
-        proc, fp, _ = start_server(spec_args, log_path=f"/tmp/inkling-verify-spec-{kv}.log")
+        # Candidate B: all custom fusions ON, DSpark n_max=2
+        proc, fp, _ = start_server(spec_args, log_path=f"/tmp/inkling-verify-on-spec-{kv}.log")
         try:
             on_spec = run_panel(PARITY_PROMPTS, max_tokens=48, logprobs=True)
         finally:
             stop_server(proc, fp)
-        parity_results.append(compare_panels(f"spec_vs_nospec_fused_{kv}", on_nospec, on_spec))
-        parity_results.append(compare_panels(f"spec_fused_vs_off_{kv}", ref_nospec, on_spec))
+
+        parity_results.append(compare_panels(f"fused_on_vs_off_nospec_{kv}", ref_nospec, on_nospec))
+        parity_results.append(compare_panels(f"fused_on_vs_off_spec_{kv}",   ref_spec,   on_spec))
+        parity_results.append(compare_panels(f"spec_vs_nospec_off_{kv}",     ref_nospec, ref_spec))
+        parity_results.append(compare_panels(f"spec_vs_nospec_on_{kv}",      on_nospec,  on_spec))
     summary["parity"] = parity_results
 
     # 4. Also verify DSpark fallback when LLAMA_INKLING_DSPARK_FAST=0 (reference draft logits path)

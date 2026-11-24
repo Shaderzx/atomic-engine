@@ -151,6 +151,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     }
     if (!dmodel.dev_output() || !dmodel.dspark_markov_w2 || !dmodel.dspark_markov_w2_b ||
             dmodel.dspark_markov_w2->type != GGML_TYPE_BF16 || !target.output || !target.output->data ||
+            target.output->ne[0] != n_embd || target.output->ne[1] < n_vocab_full || !ggml_is_contiguous(target.output) ||
             rank <= 0 || rank > 512 || (rank % 32) != 0) {
         return nullptr;
     }
@@ -511,7 +512,7 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                     if (ready_fn(dspark_backend, w2_w->ne[0], w2_w->type)) {
                         const int64_t v_eff   = w2_w->ne[1];
                         const int64_t n_draft = head_rows - 1;
-                        const float   cap     = target->hparams.f_final_logit_softcapping;
+                        const float   cap     = model.hparams.f_final_logit_softcapping;
 
                         auto * cur_active = ggml_view_2d(ctx0, cur, n_embd, n_draft, cur->nb[1], cur->nb[1]);
                         auto * base_fast  = build_lora_mm(output_w, cur_active, target->output_s);
@@ -536,14 +537,17 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
                             state = ggml_add(ctx0, candidate, ggml_mul(ctx0, gate, ggml_sub(ctx0, state, candidate)));
                             auto * latent = ggml_tanh(ctx0, chunk(2));
 
-                            auto * base_row = ggml_view_1d(ctx0, base_fast, v_eff, d * base_fast->nb[1]);
-                            prev = argmax_fn(ctx0, w2_w, w2_b_w, base_row, latent, shortlist_ids, cap);
-                            if (!prev || !ggml_backend_supports_op(dspark_backend, prev)) {
+                            auto * base_row   = ggml_view_1d(ctx0, base_fast, v_eff, d * base_fast->nb[1]);
+                            auto * argmax_out = argmax_fn(ctx0, w2_w, w2_b_w, base_row, latent, shortlist_ids, cap);
+                            if (!argmax_out || !ggml_backend_supports_op(dspark_backend, argmax_out)) {
                                 fast_ok = false;
                                 break;
                             }
-                            ggml_backend_sched_set_tensor_backend(sched, prev, dspark_backend);
-                            ids_vec = ids_vec ? ggml_concat(ctx0, ids_vec, prev, 0) : prev;
+                            ggml_backend_sched_set_tensor_backend(sched, argmax_out, dspark_backend);
+                            // Elem 0 holds raw token ID (-1 on all-NaN) for host; elem 1 holds safe clamped index (>= 0) for next step's ggml_get_rows.
+                            auto * raw_id = ggml_view_1d(ctx0, argmax_out, 1, 0);
+                            prev          = ggml_view_1d(ctx0, argmax_out, 1, sizeof(int32_t));
+                            ids_vec = ids_vec ? ggml_concat(ctx0, ids_vec, raw_id, 0) : raw_id;
                         }
 
                         if (fast_ok && ids_vec) {

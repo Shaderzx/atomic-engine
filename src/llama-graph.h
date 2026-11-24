@@ -824,10 +824,10 @@ public:
     ggml_tensor * self_rel_pos     = nullptr; // I32 [n_kv,     n_batch]
     ggml_tensor * self_rel_pos_swa = nullptr; // I32 [n_kv_swa, n_batch]
 
-    // 1D position inputs for on-the-fly relative-bias FlashAttention (eliminates 2D mask/rel_pos tensors)
-    ggml_tensor * self_q_pos       = nullptr; // I32 [n_batch]
-    ggml_tensor * self_k_pos       = nullptr; // I32 [n_kv]
-    ggml_tensor * self_k_pos_swa   = nullptr; // I32 [n_kv_swa]
+    // Compact position + sequence-membership inputs for on-the-fly relative-bias FlashAttention
+    ggml_tensor * self_q_pos       = nullptr; // I32 [2, n_batch]  ({pos, seq_id})
+    ggml_tensor * self_k_pos       = nullptr; // I32 [3, n_kv]     ({pos, seq_mask_lo, seq_mask_hi})
+    ggml_tensor * self_k_pos_swa   = nullptr; // I32 [3, n_kv_swa] ({pos, seq_mask_lo, seq_mask_hi})
 
     const uint32_t extent;
     const uint32_t extent_swa;
@@ -984,6 +984,7 @@ struct llm_graph_params {
             cparams.embeddings              == other.cparams.embeddings              &&
             cparams.embeddings_nextn        == other.cparams.embeddings_nextn        &&
             cparams.embeddings_nextn_masked == other.cparams.embeddings_nextn_masked &&
+            cparams.dspark_fast_argmax      == other.cparams.dspark_fast_argmax      &&
             cparams.causal_attn             == other.cparams.causal_attn             &&
             layer_inp_dev == other.layer_inp_dev &&
             layer_inp_src == other.layer_inp_src &&

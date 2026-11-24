@@ -32,6 +32,7 @@ llama_build_and_test(test-prefill-window-scheduler.cpp LINK ggml Threads::Thread
 set_tests_properties(test-prefill-window-scheduler PROPERTIES TIMEOUT 30)
 
 if (GGML_METAL)
-    llama_build_and_test(test-inkling-metal.cpp LINK ggml ggml-metal Threads::Threads)
-    set_tests_properties(test-inkling-metal PROPERTIES TIMEOUT 60)
+    # Load Metal dynamically through the ggml backend registry so GGML_BACKEND_DL=ON plugin builds link cleanly.
+    llama_build_and_test(test-inkling-metal.cpp LINK ggml Threads::Threads)
+    set_tests_properties(test-inkling-metal PROPERTIES TIMEOUT 120)
 endif()

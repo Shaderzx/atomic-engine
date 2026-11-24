@@ -1640,6 +1640,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     if (t_h_nextn != nullptr) {
         ggml_set_output(t_h_nextn);
     }
+    if (t_draft_ids != nullptr) {
+        ggml_set_output(t_draft_ids);
+    }
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size() && !params.cparams.embeddings_layer_inp_dev; ++il) {

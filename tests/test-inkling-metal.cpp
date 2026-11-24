@@ -5,7 +5,6 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
-#include "ggml-metal.h"
 
 #include <algorithm>
 #include <cmath>
@@ -141,7 +140,9 @@ int main(int argc, char ** argv) {
     testing t;
     for (int i = 1; i < argc; ++i) { t.set_filter(argv[i]); }
 
-    ggml_backend_ptr metal(ggml_backend_metal_init());
+    ggml_backend_load_all();
+    ggml_backend_dev_t metal_dev = ggml_backend_dev_by_name("MTL0");
+    ggml_backend_ptr metal(metal_dev ? ggml_backend_dev_init(metal_dev, nullptr) : nullptr);
     if (!metal) {
         std::fprintf(stderr, "Metal backend unavailable; skipping test-inkling-metal\n");
         return 0;
@@ -180,17 +181,19 @@ int main(int argc, char ** argv) {
             bool include_all_masked;
         };
         const std::vector<fa_case> cases = {
-            // Decode (n_q < 16), nwg=1 (n_kv=64) and split-K nwg=4 (n_kv=640) & nwg=16 (n_kv=4160)
-            {"dec_q1_f16_nwg1",     GGML_TYPE_F16,  1,   64,  32,    0, 1, false},
-            {"dec_q3_f16_split4",   GGML_TYPE_F16,  3,  640,  64,    0, 1, false},
-            {"dec_q4_q8_split4",    GGML_TYPE_Q8_0, 4,  640,  64,  256, 1, false},
-            {"dec_q3_q4_split16",   GGML_TYPE_Q4_0, 3, 4160,  64,    0, 1, false},
-            {"dec_q15_f16_multiseq",GGML_TYPE_F16, 15,  640,  64,    0, 4, true },
+            // Decode (n_q < 16), nwg=1 (n_kv=64), split-K nwg=4 (640), nwg=16 (4160), and nwg=32 (33024)
+            {"dec_q1_f16_nwg1",     GGML_TYPE_F16,  1,    64,  32,    0, 1, false},
+            {"dec_q3_f16_split4",   GGML_TYPE_F16,  3,   640,  64,    0, 1, false},
+            {"dec_q4_q8_split4",    GGML_TYPE_Q8_0, 4,   640,  64,  256, 1, false},
+            {"dec_q3_q4_split16",   GGML_TYPE_Q4_0, 3,  4160,  64,    0, 1, false},
+            {"dec_q1_f16_split32",  GGML_TYPE_F16,  1, 33024,  64,    0, 1, false},
+            {"dec_q3_q4_split32",   GGML_TYPE_Q4_0, 3, 33024,  64,    0, 2, true },
+            {"dec_q15_f16_multiseq",GGML_TYPE_F16, 15,   640,  64,    0, 4, true },
             // Prefill (n_q >= 16, partial tiles n_q=17, 48), all-far tiles + SWA + multi-seq
-            {"pre_q17_f16_global",  GGML_TYPE_F16, 17,  640,  64,    0, 1, false},
-            {"pre_q48_f16_multiseq",GGML_TYPE_F16, 48,  640,  64,    0, 3, true },
-            {"pre_q17_q8_swa",      GGML_TYPE_Q8_0,17,  640,  64,  128, 2, false},
-            {"pre_q17_q4_global",   GGML_TYPE_Q4_0,17,  640,  64,    0, 2, false},
+            {"pre_q17_f16_global",  GGML_TYPE_F16, 17,   640,  64,    0, 1, false},
+            {"pre_q48_f16_multiseq",GGML_TYPE_F16, 48,   640,  64,    0, 3, true },
+            {"pre_q17_q8_swa",      GGML_TYPE_Q8_0,17,   640,  64,  128, 2, false},
+            {"pre_q17_q4_global",   GGML_TYPE_Q4_0,17,   640,  64,    0, 2, false},
         };
 
         const float scale = 1.0f / std::sqrt(128.0f);
@@ -515,14 +518,14 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, nullptr, 30.0f);
                 t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
 
-                int32_t winner = -999;
+                int32_t out_ids[2] = {-999, -999};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
                     {tbase, {base.data(),     base.size() * sizeof(float)}},
                     {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
-                }, &winner, sizeof(winner));
-                t.assert_true(winner == 777);
+                }, out_ids, sizeof(out_ids));
+                t.assert_true(out_ids[0] == 777 && out_ids[1] == 777);
             }
 
             // 2. Shortlist remapping test
@@ -538,18 +541,18 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, tsl, 30.0f);
                 t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
 
-                int32_t winner = -999;
+                int32_t out_ids[2] = {-999, -999};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
                     {tbase, {base.data(),     base.size() * sizeof(float)}},
                     {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
                     {tsl,   {sl.data(),       sl.size() * sizeof(int32_t)}},
-                }, &winner, sizeof(winner));
-                t.assert_true(winner == 777 * 3 + 11);
+                }, out_ids, sizeof(out_ids));
+                t.assert_true(out_ids[0] == 777 * 3 + 11 && out_ids[1] == 777 * 3 + 11);
             }
 
-            // 3. All-NaN logits must return -1 (not token 0)
+            // 3. All-NaN logits must return raw=-1 (stop host drafting) and safe=0 (clamped for chained get_rows)
             {
                 std::vector<float> nan_base(vocab, std::numeric_limits<float>::quiet_NaN());
                 ggml_context_ptr ctx(ggml_init({1024 * 1024, nullptr, true}));
@@ -560,14 +563,49 @@ int main(int argc, char ** argv) {
                 auto * out   = create(ctx.get(), tw2, tw2b, tbase, tlat, nullptr, 30.0f);
                 t.assert_true(out != nullptr);
 
-                int32_t winner = 12345;
+                int32_t out_ids[2] = {12345, 12345};
                 run_graph(ctx.get(), out, {
                     {tw2,   {w2_bytes.data(), w2_bytes.size()}},
                     {tw2b,  {w2_b.data(),     w2_b.size() * sizeof(float)}},
                     {tbase, {nan_base.data(), nan_base.size() * sizeof(float)}},
                     {tlat,  {lat.data(),      lat.size() * sizeof(float)}},
-                }, &winner, sizeof(winner));
-                t.assert_true(winner == -1);
+                }, out_ids, sizeof(out_ids));
+                t.assert_true(out_ids[0] == -1 && out_ids[1] == 0);
+            }
+
+            // 4. 2-step chained DSpark graph where step 0 has all-NaN logits -> elem 1 (0) feeds ggml_get_rows safely
+            {
+                std::vector<float> nan_base(vocab, std::numeric_limits<float>::quiet_NaN());
+                auto w1_f32 = rand_vec(rank * vocab, 505, -0.5f, 0.5f);
+                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                auto * tw1    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, rank, vocab);
+                auto * tw2    = ggml_new_tensor_2d(ctx.get(), w2_type, rank, vocab);
+                auto * tw2b   = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, vocab);
+                auto * tbase0 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, vocab);
+                auto * tbase1 = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, vocab);
+                auto * tlat0  = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, rank);
+
+                auto * step0  = create(ctx.get(), tw2, tw2b, tbase0, tlat0, nullptr, 30.0f);
+                auto * raw0   = ggml_view_1d(ctx.get(), step0, 1, 0);
+                auto * safe0  = ggml_view_1d(ctx.get(), step0, 1, sizeof(int32_t));
+                // Step 1 reads row `safe0` (0, never -1) from w1 -> must not OOB-fault under MTL_SHADER_VALIDATION=1
+                auto * row1   = ggml_get_rows(ctx.get(), tw1, safe0);
+                auto * lat1   = ggml_reshape_1d(ctx.get(), row1, rank);
+                auto * step1  = create(ctx.get(), tw2, tw2b, tbase1, lat1, nullptr, 30.0f);
+                auto * raw1   = ggml_view_1d(ctx.get(), step1, 1, 0);
+                auto * ids    = ggml_concat(ctx.get(), raw0, raw1, 0);
+                t.assert_true(step0 != nullptr && step1 != nullptr && ids != nullptr);
+
+                int32_t chained[2] = {999, 999};
+                run_graph(ctx.get(), ids, {
+                    {tw1,    {w1_f32.data(),   w1_f32.size() * sizeof(float)}},
+                    {tw2,    {w2_bytes.data(), w2_bytes.size()}},
+                    {tw2b,   {w2_b.data(),     w2_b.size() * sizeof(float)}},
+                    {tbase0, {nan_base.data(), nan_base.size() * sizeof(float)}},
+                    {tbase1, {base.data(),     base.size() * sizeof(float)}},
+                    {tlat0,  {lat.data(),      lat.size() * sizeof(float)}},
+                }, chained, sizeof(chained));
+                t.assert_true(chained[0] == -1 && chained[1] == 777);
             }
         }
     });

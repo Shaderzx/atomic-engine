@@ -1220,7 +1220,8 @@ static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v1(ggml_context * 
         return nullptr;
     }
     ggml_tensor * args[] = {w2, w2_b, base_row, latent, shortlist_ids};
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_I32, 1, 1, 1, 1, args, shortlist_ids ? 5 : 4,
+    // Output [2]: elem 0 = raw token ID (or -1 on all-NaN), elem 1 = safe in-bounds index (0 on all-NaN) for chained ggml_get_rows.
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_I32, 2, 1, 1, 1, args, shortlist_ids ? 5 : 4,
             +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling DSpark argmax requires Metal"); }, 1, nullptr);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, cap);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_DSPARK_ARGMAX;

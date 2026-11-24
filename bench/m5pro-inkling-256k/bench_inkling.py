@@ -422,7 +422,7 @@ if __name__ == "__main__":
         show(*(a[1:2]))
     else:
         opt = lambda k, d=None: a[a.index(k) + 1] if k in a else d
-        run(
+        res = run(
             a[1],
             long_ctx=int(opt("--long")) if opt("--long") else None,
             reps=int(opt("--reps", 6)),
@@ -431,3 +431,5 @@ if __name__ == "__main__":
             warm_check="--warm-check" in a,
             keep_running="--keep-running" in a,
         )
+        if not res.get("ok"):
+            sys.exit(1)

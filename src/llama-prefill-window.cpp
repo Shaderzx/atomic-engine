@@ -566,7 +566,16 @@ int llama_context::decode_prefill_window(llama_memory_context_ptr & mctx, int32_
             original_cb(batch, tensor, name, layer);
             if (std::strcmp(name, layer_output) == 0) { ggml_build_forward_expand(result.get_gf(), tensor); }
         };
-        auto * graph = model.build_graph(params);
+        ggml_cgraph * graph = nullptr;
+        try {
+            graph = model.build_graph(params);
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: failed to build window graph: %s\n", __func__, e.what());
+            return static_cast<ggml_cgraph *>(nullptr);
+        }
+        if (!graph) {
+            return static_cast<ggml_cgraph *>(nullptr);
+        }
         if (fused && graph) {
             int fused_layers = 0;
             for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
