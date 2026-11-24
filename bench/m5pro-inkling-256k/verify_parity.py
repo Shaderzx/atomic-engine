@@ -142,16 +142,21 @@ def main():
         "LLAMA_INKLING_FUSED_KERNELS": "1",
         "LLAMA_INKLING_FUSED_MIX": "1",
         "LLAMA_INKLING_FUSED_CTRL": "1",
+        "LLAMA_INKLING_FUSED_CONV": "1",
+        "LLAMA_INKLING_FUSED_MOE": "1",
     }
     target_off_env = {
         "LLAMA_INKLING_FUSED_ATTN": "0",
         "LLAMA_INKLING_FUSED_KERNELS": "0",
         "LLAMA_INKLING_FUSED_MIX": "0",
         "LLAMA_INKLING_FUSED_CTRL": "0",
+        "LLAMA_INKLING_FUSED_CONV": "0",
+        "LLAMA_INKLING_FUSED_MOE": "0",
     }
     draft_fixed_env = {
         "LLAMA_INKLING_DSPARK_FAST": "0",
         "LLAMA_INKLING_PROMPT_LOOKUP": "0",
+        "LLAMA_INKLING_ADAPTIVE_K": "0",
     }
 
     # 1. MTL_SHADER_VALIDATION=1 at -c 262144 (F16 KV + DSpark n_max=2) — >32,768 tokens + verified live nwg=32 GPU dispatch
@@ -162,7 +167,7 @@ def main():
          "-c", "262144", "-b", "2048", "-ub", "2048", "-np", "1",
          "-ctk", "f16", "-ctv", "f16", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"],
         extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1",
-                   "MTL_SHADER_VALIDATION": "1", "GGML_METAL_INKLING_LOG_DISPATCH": "1"},
+                   "LLAMA_INKLING_ADAPTIVE_K": "0", "MTL_SHADER_VALIDATION": "1", "GGML_METAL_INKLING_LOG_DISPATCH": "1"},
         log_path=sv_log,
     )
     try:
@@ -171,14 +176,17 @@ def main():
         r1 = chat(long_p, max_tokens=48, timeout=420)
         n_prompt = r1["usage"]["prompt_tokens"]
         n_comp_long = r1["usage"]["completion_tokens"]
-        assert n_prompt > 32768, f"Expected prompt_tokens > 32768 to trigger nwg=32, got {n_prompt}"
-        assert n_comp_long >= 16, f"Expected >=16 decoded tokens at n_kv>32768 to force multi-step split-32 decode, got {n_comp_long}"
+        if n_prompt <= 32768:
+            raise RuntimeError(f"Expected prompt_tokens > 32768 to trigger nwg=32, got {n_prompt}")
+        if n_comp_long < 16:
+            raise RuntimeError(f"Expected >=16 decoded tokens at n_kv>32768 to force multi-step split-32 decode, got {n_comp_long}")
         r2 = chat(PARITY_PROMPTS[0], max_tokens=64, timeout=180)
     finally:
         stop_server(proc, fp)
 
     sv_lines = [ln.strip() for ln in open(sv_log, errors="replace") if "inkling_fa_decode_split32: dispatched nwg=32" in ln]
-    assert len(sv_lines) > 0, f"Server log {sv_log} did not record any nwg=32 Inkling FA decode dispatch!"
+    if len(sv_lines) == 0:
+        raise RuntimeError(f"Server log {sv_log} did not record any nwg=32 Inkling FA decode dispatch!")
     summary["shader_validation_256k"] = {
         "ok": True,
         "startup_s": st,
@@ -196,7 +204,8 @@ def main():
         ["-md", DRAFT, "--spec-type", "draft-dspark", "--spec-draft-n-max", "2", "--spec-draft-n-ubatch", "512",
          "-c", "262144", "-b", "1024", "-ub", "1024", "-np", "2", "--kv-unified",
          "-ctk", "f16", "-ctv", "f16", "-ctkd", "q8_0", "-ctvd", "q8_0", "-ngld", "99"],
-        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1",
+                   "LLAMA_INKLING_ADAPTIVE_K": "0"},
         log_path="/tmp/inkling-verify-np2.log",
     )
     try:
@@ -208,7 +217,8 @@ def main():
         r_single = chat(PARITY_PROMPTS[2], 160)
         msg_s = r_single["choices"][0]["message"]
         t_single = (msg_s.get("content") or "") or (msg_s.get("reasoning_content") or "")
-        assert "391" in t_single, f"Expected 391 in single-slot response, got {msg_s!r}"
+        if "391" not in t_single:
+            raise RuntimeError(f"Expected 391 in single-slot response, got {msg_s!r}")
         summary["multi_slot_np2_256k"] = {
             "ok": True,
             "startup_s": st,
@@ -276,10 +286,10 @@ def main():
         "The M5 Pro unified memory architecture streams quantized MoE weights directly through "
         "Metal 4 tensor accelerators while preserving full FP16 key-value precision across 262,144 tokens."
     ]
-    # 4a: DSPARK_FAST=0 vs DSPARK_FAST=1 (target_on_env + PROMPT_LOOKUP=0 fixed on both sides)
+    # 4a: DSPARK_FAST=0 vs DSPARK_FAST=1 (target_on_env + PROMPT_LOOKUP=0 + ADAPTIVE_K=0 fixed on both sides)
     proc, fp, _ = start_server(
         spec_f16,
-        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "0", "LLAMA_INKLING_PROMPT_LOOKUP": "0"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "0", "LLAMA_INKLING_PROMPT_LOOKUP": "0", "LLAMA_INKLING_ADAPTIVE_K": "0"},
         log_path="/tmp/inkling-verify-dft-ref.log",
     )
     try:
@@ -288,7 +298,7 @@ def main():
         stop_server(proc, fp)
     proc, fp, _ = start_server(
         spec_f16,
-        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0", "LLAMA_INKLING_ADAPTIVE_K": "0"},
         log_path="/tmp/inkling-verify-dft-fast.log",
     )
     try:
@@ -297,12 +307,12 @@ def main():
         stop_server(proc, fp)
     summary["dspark_fast_vs_ref"] = compare_panels("dspark_fast_on_vs_off_f16", dft_ref, dft_fast)
 
-    # 4b: PROMPT_LOOKUP=0 vs PROMPT_LOOKUP=1 (target_on_env + DSPARK_FAST=1 fixed on both sides; requires >=1 actual lookup hit!)
+    # 4b: PROMPT_LOOKUP=0 vs PROMPT_LOOKUP=1 (target_on_env + DSPARK_FAST=1 + ADAPTIVE_K=0 fixed on both sides; requires >=1 actual lookup hit!)
     pl_off_log = "/tmp/inkling-verify-pl-off.log"
     pl_on_log  = "/tmp/inkling-verify-pl-on.log"
     proc, fp, _ = start_server(
         spec_f16,
-        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0", "LLAMA_INKLING_LOG_LOOKUP": "1"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "0", "LLAMA_INKLING_ADAPTIVE_K": "0", "LLAMA_INKLING_LOG_LOOKUP": "1"},
         log_path=pl_off_log,
     )
     try:
@@ -311,7 +321,7 @@ def main():
         stop_server(proc, fp)
     proc, fp, _ = start_server(
         spec_f16,
-        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1", "LLAMA_INKLING_LOG_LOOKUP": "1"},
+        extra_env={**target_on_env, "LLAMA_INKLING_DSPARK_FAST": "1", "LLAMA_INKLING_PROMPT_LOOKUP": "1", "LLAMA_INKLING_ADAPTIVE_K": "0", "LLAMA_INKLING_LOG_LOOKUP": "1"},
         log_path=pl_on_log,
     )
     try:
@@ -320,8 +330,10 @@ def main():
         stop_server(proc, fp)
     pl_hits_off = sum("inkling_prompt_lookup: hit" in ln for ln in open(pl_off_log, errors="replace"))
     pl_hits_on  = sum("inkling_prompt_lookup: hit" in ln for ln in open(pl_on_log, errors="replace"))
-    assert pl_hits_off == 0, f"Expected 0 prompt-lookup hits when PROMPT_LOOKUP=0, got {pl_hits_off}"
-    assert pl_hits_on > 0, f"Expected >=1 prompt-lookup hit when PROMPT_LOOKUP=1 on verbatim-repeat panel, got {pl_hits_on}"
+    if pl_hits_off != 0:
+        raise RuntimeError(f"Expected 0 prompt-lookup hits when PROMPT_LOOKUP=0, got {pl_hits_off}")
+    if pl_hits_on <= 0:
+        raise RuntimeError(f"Expected >=1 prompt-lookup hit when PROMPT_LOOKUP=1 on verbatim-repeat panel, got {pl_hits_on}")
     pl_res = compare_panels("prompt_lookup_on_vs_off_f16", pl_off, pl_on)
     pl_res["lookup_hits_off"] = pl_hits_off
     pl_res["lookup_hits_on"] = pl_hits_on

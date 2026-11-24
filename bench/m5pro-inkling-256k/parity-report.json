@@ -1,16 +1,16 @@
 {
   "shader_validation_256k": {
     "ok": true,
-    "startup_s": 2.14,
+    "startup_s": 6.39,
     "long_prompt_tokens": 36027,
     "long_completion_tokens": 48,
-    "nwg_32_dispatches": 184,
+    "nwg_32_dispatches": 192,
     "nwg_32_sample_log": "inkling_fa_decode_split32: dispatched nwg=32 n_q=4 n_kv=36096 type=f16",
     "short_completion_tokens": 64
   },
   "multi_slot_np2_256k": {
     "ok": true,
-    "startup_s": 1.51,
+    "startup_s": 1.52,
     "slot0_tokens": 96,
     "slot1_tokens": 96,
     "drop_to_1_answer": "391"
@@ -19,20 +19,20 @@
     {
       "name": "target_fused_on_vs_off_nospec_f16",
       "prompts": 12,
-      "exact_text_match": "11/12",
+      "exact_text_match": "10/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "550/576 (95.5%)",
-      "max_matched_logprob_diff": 0.098749,
-      "med_matched_logprob_diff": 3.1e-05
+      "prefix_token_agreement": "514/576 (89.2%)",
+      "max_matched_logprob_diff": 0.130255,
+      "med_matched_logprob_diff": 0.000137
     },
     {
       "name": "target_fused_on_vs_off_spec_f16",
       "prompts": 12,
-      "exact_text_match": "12/12",
+      "exact_text_match": "10/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "576/576 (100.0%)",
-      "max_matched_logprob_diff": 0.099154,
-      "med_matched_logprob_diff": 2.2e-05
+      "prefix_token_agreement": "514/576 (89.2%)",
+      "max_matched_logprob_diff": 0.13234,
+      "med_matched_logprob_diff": 0.000141
     },
     {
       "name": "spec_vs_nospec_target_off_f16",
@@ -40,89 +40,89 @@
       "exact_text_match": "12/12",
       "first_token_match": "12/12",
       "prefix_token_agreement": "576/576 (100.0%)",
-      "max_matched_logprob_diff": 0.080134,
-      "med_matched_logprob_diff": 2e-06
+      "max_matched_logprob_diff": 0.053962,
+      "med_matched_logprob_diff": 3e-06
     },
     {
       "name": "spec_vs_nospec_target_on_f16",
       "prompts": 12,
-      "exact_text_match": "11/12",
+      "exact_text_match": "12/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "550/576 (95.5%)",
-      "max_matched_logprob_diff": 0.012249,
+      "prefix_token_agreement": "576/576 (100.0%)",
+      "max_matched_logprob_diff": 0.052409,
       "med_matched_logprob_diff": 1e-06
     },
     {
       "name": "target_fused_on_vs_off_nospec_q8_0",
       "prompts": 12,
-      "exact_text_match": "9/12",
+      "exact_text_match": "8/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "531/576 (92.2%)",
-      "max_matched_logprob_diff": 0.131082,
-      "med_matched_logprob_diff": 9.8e-05
+      "prefix_token_agreement": "523/576 (90.8%)",
+      "max_matched_logprob_diff": 0.101875,
+      "med_matched_logprob_diff": 0.000105
     },
     {
       "name": "target_fused_on_vs_off_spec_q8_0",
       "prompts": 12,
-      "exact_text_match": "10/12",
+      "exact_text_match": "9/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "542/576 (94.1%)",
-      "max_matched_logprob_diff": 0.15619,
-      "med_matched_logprob_diff": 0.000148
+      "prefix_token_agreement": "518/576 (89.9%)",
+      "max_matched_logprob_diff": 0.242046,
+      "med_matched_logprob_diff": 0.00014
     },
     {
       "name": "spec_vs_nospec_target_off_q8_0",
       "prompts": 12,
-      "exact_text_match": "10/12",
+      "exact_text_match": "9/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "560/576 (97.2%)",
-      "max_matched_logprob_diff": 0.216759,
-      "med_matched_logprob_diff": 6.5e-05
+      "prefix_token_agreement": "526/576 (91.3%)",
+      "max_matched_logprob_diff": 0.096585,
+      "med_matched_logprob_diff": 4.4e-05
     },
     {
       "name": "spec_vs_nospec_target_on_q8_0",
       "prompts": 12,
-      "exact_text_match": "10/12",
+      "exact_text_match": "8/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "536/576 (93.1%)",
-      "max_matched_logprob_diff": 0.107953,
-      "med_matched_logprob_diff": 3e-05
+      "prefix_token_agreement": "511/576 (88.7%)",
+      "max_matched_logprob_diff": 0.172537,
+      "med_matched_logprob_diff": 2.7e-05
     },
     {
       "name": "target_fused_on_vs_off_nospec_q4_0",
       "prompts": 12,
-      "exact_text_match": "6/12",
+      "exact_text_match": "1/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "453/576 (78.6%)",
-      "max_matched_logprob_diff": 0.279082,
-      "med_matched_logprob_diff": 0.000409
+      "prefix_token_agreement": "365/575 (63.5%)",
+      "max_matched_logprob_diff": 0.312124,
+      "med_matched_logprob_diff": 0.000303
     },
     {
       "name": "target_fused_on_vs_off_spec_q4_0",
       "prompts": 12,
-      "exact_text_match": "8/12",
+      "exact_text_match": "3/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "495/576 (85.9%)",
-      "max_matched_logprob_diff": 0.442075,
-      "med_matched_logprob_diff": 0.000254
+      "prefix_token_agreement": "393/576 (68.2%)",
+      "max_matched_logprob_diff": 0.376386,
+      "med_matched_logprob_diff": 0.00011
     },
     {
       "name": "spec_vs_nospec_target_off_q4_0",
       "prompts": 12,
-      "exact_text_match": "7/12",
+      "exact_text_match": "6/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "478/576 (83.0%)",
-      "max_matched_logprob_diff": 0.239973,
-      "med_matched_logprob_diff": 0.000322
+      "prefix_token_agreement": "442/575 (76.9%)",
+      "max_matched_logprob_diff": 0.278451,
+      "med_matched_logprob_diff": 0.000156
     },
     {
       "name": "spec_vs_nospec_target_on_q4_0",
       "prompts": 12,
-      "exact_text_match": "8/12",
+      "exact_text_match": "9/12",
       "first_token_match": "12/12",
-      "prefix_token_agreement": "507/576 (88.0%)",
-      "max_matched_logprob_diff": 0.273505,
-      "med_matched_logprob_diff": 0.000221
+      "prefix_token_agreement": "552/576 (95.8%)",
+      "max_matched_logprob_diff": 0.17447,
+      "med_matched_logprob_diff": 0.000252
     }
   ],
   "dspark_fast_vs_ref": {
@@ -140,9 +140,9 @@
     "exact_text_match": "6/6",
     "first_token_match": "6/6",
     "prefix_token_agreement": "288/288 (100.0%)",
-    "max_matched_logprob_diff": 0.0,
+    "max_matched_logprob_diff": 0.059381,
     "med_matched_logprob_diff": 0.0,
     "lookup_hits_off": 0,
-    "lookup_hits_on": 7
+    "lookup_hits_on": 4
   }
 }
