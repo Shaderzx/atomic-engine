@@ -485,9 +485,9 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
         if (!fast_env || std::strcmp(fast_env, "0") != 0) {
             auto reg = ggml_backend_dev_backend_reg(model.dev_output());
             auto ready_fn = reinterpret_cast<inkling_dspark_argmax_ready_fn>(
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_ready_v1"));
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_ready_v2"));
             auto argmax_fn = reinterpret_cast<inkling_dspark_argmax_fn>(
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v1"));
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v2"));
             ggml_backend_t dspark_backend = nullptr;
             for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                 auto b = ggml_backend_sched_get_backend(sched, i);
@@ -539,7 +539,8 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
 
                             auto * base_row   = ggml_view_1d(ctx0, base_fast, v_eff, d * base_fast->nb[1]);
                             auto * argmax_out = argmax_fn(ctx0, w2_w, w2_b_w, base_row, latent, shortlist_ids, cap);
-                            if (!argmax_out || !ggml_backend_supports_op(dspark_backend, argmax_out)) {
+                            if (!argmax_out || argmax_out->type != GGML_TYPE_I32 || ggml_nelements(argmax_out) < 2 ||
+                                    !ggml_backend_supports_op(dspark_backend, argmax_out)) {
                                 fast_ok = false;
                                 break;
                             }

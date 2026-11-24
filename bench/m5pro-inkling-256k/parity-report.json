@@ -1,9 +1,11 @@
 {
   "shader_validation_256k": {
     "ok": true,
-    "startup_s": 2.44,
-    "long_prompt_tokens": 40823,
-    "nwg_32_exercised": true,
+    "startup_s": 2.14,
+    "long_prompt_tokens": 36027,
+    "long_completion_tokens": 48,
+    "nwg_32_dispatches": 184,
+    "nwg_32_sample_log": "inkling_fa_decode_split32: dispatched nwg=32 n_q=4 n_kv=36096 type=f16",
     "short_completion_tokens": 64
   },
   "multi_slot_np2_256k": {
@@ -15,7 +17,7 @@
   },
   "parity": [
     {
-      "name": "fused_on_vs_off_nospec_f16",
+      "name": "target_fused_on_vs_off_nospec_f16",
       "prompts": 12,
       "exact_text_match": "11/12",
       "first_token_match": "12/12",
@@ -24,7 +26,7 @@
       "med_matched_logprob_diff": 3.1e-05
     },
     {
-      "name": "fused_on_vs_off_spec_f16",
+      "name": "target_fused_on_vs_off_spec_f16",
       "prompts": 12,
       "exact_text_match": "12/12",
       "first_token_match": "12/12",
@@ -33,7 +35,7 @@
       "med_matched_logprob_diff": 2.2e-05
     },
     {
-      "name": "spec_vs_nospec_off_f16",
+      "name": "spec_vs_nospec_target_off_f16",
       "prompts": 12,
       "exact_text_match": "12/12",
       "first_token_match": "12/12",
@@ -42,7 +44,7 @@
       "med_matched_logprob_diff": 2e-06
     },
     {
-      "name": "spec_vs_nospec_on_f16",
+      "name": "spec_vs_nospec_target_on_f16",
       "prompts": 12,
       "exact_text_match": "11/12",
       "first_token_match": "12/12",
@@ -51,7 +53,7 @@
       "med_matched_logprob_diff": 1e-06
     },
     {
-      "name": "fused_on_vs_off_nospec_q8_0",
+      "name": "target_fused_on_vs_off_nospec_q8_0",
       "prompts": 12,
       "exact_text_match": "9/12",
       "first_token_match": "12/12",
@@ -60,7 +62,7 @@
       "med_matched_logprob_diff": 9.8e-05
     },
     {
-      "name": "fused_on_vs_off_spec_q8_0",
+      "name": "target_fused_on_vs_off_spec_q8_0",
       "prompts": 12,
       "exact_text_match": "10/12",
       "first_token_match": "12/12",
@@ -69,7 +71,7 @@
       "med_matched_logprob_diff": 0.000148
     },
     {
-      "name": "spec_vs_nospec_off_q8_0",
+      "name": "spec_vs_nospec_target_off_q8_0",
       "prompts": 12,
       "exact_text_match": "10/12",
       "first_token_match": "12/12",
@@ -78,7 +80,7 @@
       "med_matched_logprob_diff": 6.5e-05
     },
     {
-      "name": "spec_vs_nospec_on_q8_0",
+      "name": "spec_vs_nospec_target_on_q8_0",
       "prompts": 12,
       "exact_text_match": "10/12",
       "first_token_match": "12/12",
@@ -87,7 +89,7 @@
       "med_matched_logprob_diff": 3e-05
     },
     {
-      "name": "fused_on_vs_off_nospec_q4_0",
+      "name": "target_fused_on_vs_off_nospec_q4_0",
       "prompts": 12,
       "exact_text_match": "6/12",
       "first_token_match": "12/12",
@@ -96,7 +98,7 @@
       "med_matched_logprob_diff": 0.000409
     },
     {
-      "name": "fused_on_vs_off_spec_q4_0",
+      "name": "target_fused_on_vs_off_spec_q4_0",
       "prompts": 12,
       "exact_text_match": "8/12",
       "first_token_match": "12/12",
@@ -105,7 +107,7 @@
       "med_matched_logprob_diff": 0.000254
     },
     {
-      "name": "spec_vs_nospec_off_q4_0",
+      "name": "spec_vs_nospec_target_off_q4_0",
       "prompts": 12,
       "exact_text_match": "7/12",
       "first_token_match": "12/12",
@@ -114,7 +116,7 @@
       "med_matched_logprob_diff": 0.000322
     },
     {
-      "name": "spec_vs_nospec_on_q4_0",
+      "name": "spec_vs_nospec_target_on_q4_0",
       "prompts": 12,
       "exact_text_match": "8/12",
       "first_token_match": "12/12",
@@ -124,7 +126,16 @@
     }
   ],
   "dspark_fast_vs_ref": {
-    "name": "dspark_fast_vs_ref_f16",
+    "name": "dspark_fast_on_vs_off_f16",
+    "prompts": 6,
+    "exact_text_match": "6/6",
+    "first_token_match": "6/6",
+    "prefix_token_agreement": "288/288 (100.0%)",
+    "max_matched_logprob_diff": 0.0,
+    "med_matched_logprob_diff": 0.0
+  },
+  "prompt_lookup_vs_off": {
+    "name": "prompt_lookup_on_vs_off_f16",
     "prompts": 6,
     "exact_text_match": "6/6",
     "first_token_match": "6/6",

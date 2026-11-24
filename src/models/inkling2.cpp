@@ -351,24 +351,39 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
         }
 
         // On Metal, fail fast instead of hanging in sched_reserve when the dense kq_b fallback
-        // exceeds free GPU memory (e.g. non-Metal-4 Macs or --no-kv-unified at 256K).
+        // exceeds available GPU memory (e.g. non-Metal-4 Macs or --no-kv-unified at 256K).
         const char * allow_dense = std::getenv("LLAMA_INKLING_ALLOW_DENSE_KQ_B");
         const bool bypass_dense_guard = allow_dense && std::strcmp(allow_dense, "1") == 0;
         if (!flash_create && !bypass_dense_guard && attn_ctx && device &&
                 std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0) {
             size_t mem_free = 0, mem_total = 0;
             ggml_backend_dev_memory(device, &mem_free, &mem_total);
+            // Add back any compute buffer already reserved in `sched` on this device so repeat
+            // graph_reserve / decode calls do not double-count reusable scheduler memory.
+            size_t sched_buf_bytes = 0;
+            if (sched) {
+                for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+                    auto b = ggml_backend_sched_get_backend(sched, i);
+                    if (ggml_backend_get_device(b) == device) {
+                        sched_buf_bytes += ggml_backend_sched_get_buffer_size(sched, b);
+                    }
+                }
+            }
             const int64_t n_kv_base = attn_ctx->get_base()->get_n_kv();
             const int64_t kq_b_elem_bytes = (inkling_dense_backend && rel_mask_kernel) ? 2 : 4;
-            const int64_t est_dense_bytes = n_kv_base * n_tokens * (hparams.n_head(0) * kq_b_elem_bytes + 4);
-            if (mem_free > 0 && est_dense_bytes > (int64_t) mem_free) {
-                LLAMA_LOG_ERROR("%s: Metal dense Inkling kq_b fallback requires %.2f GiB > %.2f GiB free GPU memory "
-                        "(n_kv=%lld, n_tokens=%lld); long-context Inkling on Metal requires fused FlashAttention "
-                        "(Metal 4 tensor ops, -fa on, unified KV or -np 1, -np <= 64, matching K/V dtypes in {f16, q8_0, q4_0}; "
-                        "set LLAMA_INKLING_ALLOW_DENSE_KQ_B=1 to override)\n",
-                        __func__, est_dense_bytes / double(1LL << 30), mem_free / double(1LL << 30),
+            const uint64_t est_dense_bytes = (n_kv_base > 0 && n_tokens > 0)
+                    ? (uint64_t) n_kv_base * (uint64_t) n_tokens * (uint64_t) (hparams.n_head(0) * kq_b_elem_bytes + 4)
+                    : 0ULL;
+            const uint64_t avail_bytes = (uint64_t) mem_free + (uint64_t) sched_buf_bytes;
+            if (mem_total > 0 && est_dense_bytes > avail_bytes) {
+                LLAMA_LOG_ERROR("%s: Metal dense Inkling kq_b fallback requires %.2f GiB > %.2f GiB available GPU memory "
+                        "(free=%.2f GiB + reusable_sched=%.2f GiB, n_kv=%lld, n_tokens=%lld); long-context Inkling on Metal "
+                        "requires fused FlashAttention (Metal 4 tensor ops, -fa on, unified KV or -np 1, -np <= 64, "
+                        "matching K/V dtypes in {f16, q8_0, q4_0}; set LLAMA_INKLING_ALLOW_DENSE_KQ_B=1 to override)\n",
+                        __func__, est_dense_bytes / double(1ULL << 30), avail_bytes / double(1ULL << 30),
+                        mem_free / double(1ULL << 30), sched_buf_bytes / double(1ULL << 30),
                         (long long) n_kv_base, (long long) n_tokens);
-                throw std::runtime_error("Metal dense Inkling kq_b fallback exceeds free GPU memory");
+                throw std::runtime_error("Metal dense Inkling kq_b fallback exceeds available GPU memory");
             }
         }
     }

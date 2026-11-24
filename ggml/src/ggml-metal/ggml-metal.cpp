@@ -1185,7 +1185,7 @@ static ggml_tensor * ggml_backend_metal_inkling_ctrl_apply_v1(ggml_context * ctx
     return node;
 }
 
-static bool ggml_backend_metal_inkling_dspark_argmax_ready_v1(ggml_backend_t backend,
+static bool ggml_backend_metal_inkling_dspark_argmax_ready_v2(ggml_backend_t backend,
         int64_t rank, ggml_type w2_type) {
     if (!ggml_backend_is_metal(backend) || rank <= 0 || rank > 512 || (rank % 32) != 0) {
         return false;
@@ -1201,7 +1201,7 @@ static bool ggml_backend_metal_inkling_dspark_argmax_ready_v1(ggml_backend_t bac
     return false;
 }
 
-static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v1(ggml_context * ctx,
+static ggml_tensor * ggml_backend_metal_inkling_dspark_argmax_v2(ggml_context * ctx,
         ggml_tensor * w2, ggml_tensor * w2_b, ggml_tensor * base_row,
         ggml_tensor * latent, ggml_tensor * shortlist_ids, float cap) {
     if (!w2 || !w2_b || !base_row || !latent ||
@@ -1495,11 +1495,11 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_metal_inkling_ctrl_apply_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_ctrl_apply_v1;
     }
-    if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_ready_v1") == 0) {
-        return (void *) ggml_backend_metal_inkling_dspark_argmax_ready_v1;
+    if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_ready_v2") == 0) {
+        return (void *) ggml_backend_metal_inkling_dspark_argmax_ready_v2;
     }
-    if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_v1") == 0) {
-        return (void *) ggml_backend_metal_inkling_dspark_argmax_v1;
+    if (strcmp(name, "ggml_backend_metal_inkling_dspark_argmax_v2") == 0) {
+        return (void *) ggml_backend_metal_inkling_dspark_argmax_v2;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_mul_sigmoid_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_mul_sigmoid_v1;

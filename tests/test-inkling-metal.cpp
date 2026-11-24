@@ -481,8 +481,8 @@ int main(int argc, char ** argv) {
     });
 
     t.test("inkling_dspark_argmax Q8_0/BF16, shortlist, softcap first-max tie, and all-NaN -> -1", [&](testing & t) {
-        auto ready  = reinterpret_cast<dspark_ready_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_ready_v1"));
-        auto create = reinterpret_cast<dspark_argmax_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v1"));
+        auto ready  = reinterpret_cast<dspark_ready_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_ready_v2"));
+        auto create = reinterpret_cast<dspark_argmax_fn>(ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_dspark_argmax_v2"));
         t.assert_true(ready != nullptr && create != nullptr);
 
         // Unsupported rank must return false cleanly

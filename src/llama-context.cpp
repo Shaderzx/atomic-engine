@@ -2173,7 +2173,12 @@ int llama_context::encode(const llama_batch_ext & batch_inp) {
         t_compute_start_us = ggml_time_us();
     }
 
-    sched_reserve();
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: failed to reserve compute buffers: %s\n", __func__, e.what());
+        return -2;
+    }
 
     n_queued_tokens += n_tokens;
 
@@ -2533,7 +2538,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
         expert_executor->set_compact_inkling_scheduler(false);
         sched_need_reserve = true;
     }
-    sched_reserve();
+    try {
+        sched_reserve();
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: failed to reserve compute buffers: %s\n", __func__, e.what());
+        return -2;
+    }
 
     bool did_optimize = false;
 
@@ -3060,7 +3070,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp, size_t uncached_pro
         reset_expert_graphs();
         sched.reset();
         sched_need_reserve = true;
-        sched_reserve();
+        try {
+            sched_reserve();
+        } catch (const std::exception & e) {
+            LLAMA_LOG_ERROR("%s: failed to re-reserve compute buffers: %s\n", __func__, e.what());
+            return -2;
+        }
     }
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
@@ -5608,7 +5623,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 int32_t llama_encode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->encode(batch);
+    int ret = -2;
+    try {
+        ret = ctx->encode(batch);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: exception during encode: %s\n", __func__, e.what());
+        return -2;
+    }
     if (ret != 0) {
         LLAMA_LOG_ERROR("%s: failed to encode, ret = %d\n", __func__, ret);
     }
@@ -5619,7 +5640,13 @@ int32_t llama_encode(
 int32_t llama_decode(
         llama_context * ctx,
           llama_batch   batch) {
-    const int ret = ctx->decode(batch);
+    int ret = -2;
+    try {
+        ret = ctx->decode(batch);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_ERROR("%s: exception during decode: %s\n", __func__, e.what());
+        return -2;
+    }
     if (ret != 0 && ret != 1) {
         LLAMA_LOG_ERROR("%s: failed to decode, ret = %d\n", __func__, ret);
     }

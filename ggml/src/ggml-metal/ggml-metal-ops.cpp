@@ -17,6 +17,9 @@
 #include <algorithm>
 #include <limits>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 extern "C" void ggml_metal_encoder_set_expert_addresses(ggml_metal_encoder_t, const ggml_metal_buffer_id *, size_t);
 
@@ -364,6 +367,18 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_buffer(ctx->enc, bid_dst, 8);
                         ggml_metal_encoder_set_buffer(ctx->enc, bid_tmp, 9);
                         ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + bq - 1) / bq, 8, nwg, 32, 4, 1);
+
+                        if (nwg >= GGML_METAL_INKLING_FA_SPLIT_MAX_NWG) {
+                            static const bool log_split32 = []() {
+                                const char * v = std::getenv("GGML_METAL_INKLING_LOG_DISPATCH");
+                                return v && std::strcmp(v, "1") == 0;
+                            }();
+                            if (log_split32) {
+                                std::fprintf(stderr, "inkling_fa_decode_split32: dispatched nwg=%u n_q=%u n_kv=%u type=%s\n",
+                                        nwg, n_q, n_kv, ggml_type_name(kv_type));
+                                std::fflush(stderr);
+                            }
+                        }
 
                         if (nwg > 1u) {
                             ggml_metal_op_concurrency_reset(ctx);
