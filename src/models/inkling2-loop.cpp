@@ -94,12 +94,14 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
         const char * control = std::getenv("LLAMA_EXPERIMENTAL_INKLING_CONTROL");
         const char * mix_env = std::getenv("LLAMA_INKLING_FUSED_MIX");
         const char * ctrl_env = std::getenv("LLAMA_INKLING_FUSED_CTRL");
+        const char * conv_fused_env = std::getenv("LLAMA_INKLING_FUSED_CONV");
         const bool use_control = (resident_fused || n_tokens == 4) && model.devices.size() == 1 &&
                 model.n_gpu_layers() > hparams.n_layer_all && !llama_expert_acceleration_off() &&
                 (!control || std::strcmp(control, "1") == 0);
         const bool use_mix = resident_fused && (!mix_env || std::strcmp(mix_env, "0") != 0);
         const bool use_ctrl_full = resident_fused && (!ctrl_env || std::strcmp(ctrl_env, "0") != 0);
-        if ((use_rel || use_conv || use_clip || use_control || use_mix || use_ctrl_full) &&
+        const bool use_conv_fused = resident_fused && (!conv_fused_env || std::strcmp(conv_fused_env, "0") != 0);
+        if ((use_rel || use_conv || use_conv_fused || use_clip || use_control || use_mix || use_ctrl_full) &&
                 device && std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0) {
             const auto reg = ggml_backend_dev_backend_reg(device);
             if (use_control) {
@@ -109,6 +111,12 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             if (use_mix) {
                 mix_kernel = reinterpret_cast<decltype(mix_kernel)>(
                     ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_mix_v1"));
+                mix_norm_kernel = reinterpret_cast<decltype(mix_norm_kernel)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_mix_norm_v1"));
+            }
+            if (use_conv_fused) {
+                conv_fused_kernel = reinterpret_cast<decltype(conv_fused_kernel)>(
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_conv_fused_v1"));
             }
             if (use_ctrl_full) {
                 ctrl_down_kernel = reinterpret_cast<decltype(ctrl_down_kernel)>(

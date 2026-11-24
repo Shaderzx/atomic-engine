@@ -1604,6 +1604,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     const struct ggml_tensor * sinks = op->src[4];
                     const struct ggml_tensor * qpos  = op->src[5];
                     const struct ggml_tensor * kpos  = op->src[6];
+                    const struct ggml_tensor * gate  = op->src[7];
                     const int32_t extent = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
                     const int32_t n_swa  = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4];
                     if (!q || !k || !v || !tbl || !sinks || !qpos || !kpos ||
@@ -1613,7 +1614,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     }
                     const bool kv_ok = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) &&
                                        v->type == k->type;
-                    return kv_ok &&
+                    const bool gate_ok = !gate || (q->ne[2] < 16 &&
+                                                   gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) &&
+                                                   gate->ne[0] == q->ne[0] * q->ne[1] && gate->ne[1] == q->ne[2] &&
+                                                   gate->ne[2] == 1 && gate->ne[3] == 1);
+                    return kv_ok && gate_ok &&
                            q->type == GGML_TYPE_F32 && q->ne[0] == 128 && q->ne[1] == 24 && q->ne[2] > 0 && q->ne[3] == 1 &&
                            k->ne[0] == 128 && k->ne[1] == 8 && k->ne[2] > 0 && (k->ne[2] % 64) == 0 && k->ne[3] == 1 &&
                            ggml_are_same_shape(k, v) &&
@@ -1623,21 +1628,86 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                            kpos->type == GGML_TYPE_I32 && kpos->ne[0] == 3 && kpos->ne[1] == k->ne[2] &&
                            (q->ne[2] < 16 || dev->props.has_tensor);
                 }
-                if (tag == GGML_METAL_INKLING_MIX) {
+                if (tag == GGML_METAL_INKLING_MIX || tag == GGML_METAL_INKLING_MIX_NORM) {
+                    const bool    has_norm = tag == GGML_METAL_INKLING_MIX_NORM;
                     const int32_t n_states = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
                     const int32_t n_q      = op->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2];
-                    if (n_states < 1 || n_states > GGML_METAL_INKLING_MIX_MAX_STATES || n_q < 1 || n_q > 4) {
+                    if (n_states < 1 || n_states > GGML_METAL_INKLING_MIX_MAX_STATES || n_q < 1 || n_q > (has_norm ? 3 : 4)) {
+                        return false;
+                    }
+                    if (has_norm && n_states + 1 + n_q >= GGML_MAX_SRC) {
                         return false;
                     }
                     const struct ggml_tensor * query = op->src[n_states];
                     if (!query || query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query) ||
-                            query->ne[0] <= 0 || (query->ne[0] % 4) != 0 || query->ne[1] != n_q) {
+                            query->ne[0] <= 0 || (query->ne[0] % 4) != 0 || query->ne[1] != n_q ||
+                            (has_norm && query->ne[0] > 4096)) {
                         return false;
                     }
                     for (int32_t i = 0; i < n_states; ++i) {
                         const struct ggml_tensor * s = op->src[i];
                         if (!s || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
                                 s->ne[0] != query->ne[0] || s->ne[1] != op->ne[1]) {
+                            return false;
+                        }
+                    }
+                    if (has_norm) {
+                        for (int32_t q = 0; q < n_q; ++q) {
+                            const struct ggml_tensor * nw = op->src[n_states + 1 + q];
+                            if (!nw || nw->type != GGML_TYPE_F32 || !ggml_is_contiguous(nw) ||
+                                    nw->ne[0] != query->ne[0] || ggml_nelements(nw) != query->ne[0]) {
+                                return false;
+                            }
+                        }
+                    }
+                    return true;
+                }
+                if (tag == GGML_METAL_INKLING_CONV_FUSED) {
+                    const struct ggml_tensor * cur   = op->src[0];
+                    const struct ggml_tensor * w     = op->src[1];
+                    const struct ggml_tensor * hist  = op->src[2];
+                    const struct ggml_tensor * state = op->src[3];
+                    const uint32_t ch_offset    = (uint32_t)op->op_params[0];
+                    const uint32_t n_seq_tokens = (uint32_t)op->op_params[1];
+                    const uint32_t n_seqs       = (uint32_t)op->op_params[2];
+                    const uint32_t kw           = (uint32_t)op->op_params[3];
+                    const uint32_t head         = (uint32_t)op->op_params[4];
+                    const uint32_t n_cells      = (uint32_t)op->op_params[5];
+                    const uint32_t flags        = (uint32_t)op->op_params[6];
+                    const bool has_dyn          = (flags & 1u) != 0u;
+                    const bool has_res          = (flags & 2u) != 0u;
+                    const int  dyn_idx          = has_dyn ? 4 : -1;
+                    const int  res_idx          = has_res ? (has_dyn ? 5 : 4) : -1;
+                    if (!cur || !w || !hist || !state ||
+                            cur->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+                            hist->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+                            !ggml_is_contiguous(cur) || !ggml_is_contiguous(w) ||
+                            !ggml_is_contiguous(hist) || !ggml_is_contiguous(state) ||
+                            n_seq_tokens == 0 || n_seq_tokens > 32 || n_seqs == 0 ||
+                            kw == 0 || kw > n_seq_tokens || n_cells == 0 ||
+                            cur->ne[0] <= 0 || cur->ne[1] != (int64_t)n_seq_tokens * (int64_t)n_seqs ||
+                            cur->ne[2] != 1 || cur->ne[3] != 1 ||
+                            w->ne[0] != 4 || ggml_nrows(w) != cur->ne[0] ||
+                            hist->ne[0] != 3 || hist->ne[2] != (int64_t)n_seqs || hist->ne[3] != 1 ||
+                            (int64_t)ch_offset + cur->ne[0] > hist->ne[1] ||
+                            (state->nb[1] % sizeof(float)) != 0 ||
+                            ((int64_t)ch_offset + cur->ne[0]) * 3 > (int64_t)(state->nb[1] / sizeof(float)) ||
+                            (int64_t)head + (int64_t)n_seqs > (int64_t)n_cells ||
+                            (int64_t)(kw - 1) * (int64_t)n_cells + (int64_t)head + (int64_t)n_seqs > state->ne[1]) {
+                        return false;
+                    }
+                    if (dyn_idx >= 0) {
+                        const struct ggml_tensor * dyn = op->src[dyn_idx];
+                        if (!dyn || dyn->type != GGML_TYPE_F32 || !ggml_is_contiguous(dyn) ||
+                                dyn->ne[1] != cur->ne[1] || dyn->ne[2] != 1 || dyn->ne[3] != 1 ||
+                                dyn->ne[0] <= 0 || (dyn->ne[0] % 4) != 0 || (cur->ne[0] % (dyn->ne[0] / 4)) != 0) {
+                            return false;
+                        }
+                    }
+                    if (res_idx >= 0) {
+                        const struct ggml_tensor * res = op->src[res_idx];
+                        if (!res || res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) ||
+                                !ggml_are_same_shape(res, cur)) {
                             return false;
                         }
                     }

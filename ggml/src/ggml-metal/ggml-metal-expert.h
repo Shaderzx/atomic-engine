@@ -26,6 +26,8 @@ enum { GGML_METAL_INKLING_CTRL_APPLY = 0x4154453D };
 enum { GGML_METAL_INKLING_DSPARK_ARGMAX = 0x4154453E };
 enum { GGML_METAL_INKLING_MUL_SIGMOID = 0x4154453F };
 enum { GGML_METAL_INKLING_SOFTCAP_TRIM = 0x41544540 };
+enum { GGML_METAL_INKLING_CONV_FUSED = 0x41544541 };
+enum { GGML_METAL_INKLING_MIX_NORM = 0x41544542 };
 
 // Shared layout constants between host Metal allocator/encoders and kernels.
 // Split-K decode partition layout: 128 output floats + m + s + 2 pad floats = 132 floats (528 B, 16-byte aligned for float4).

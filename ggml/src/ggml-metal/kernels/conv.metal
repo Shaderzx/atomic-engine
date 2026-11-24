@@ -28,6 +28,85 @@ kernel void kernel_inkling_conv_residual(
     output[idx] = (cur[idx] + result) * scale;
 }
 
+// Fused Inkling short convolution + recurrent state update (both single-slot and speculative rollback)
+// + optional dynamic taps + optional trailing residual add. Eliminates CONCAT, CPY/SET_ROWS,
+// arange/scale/cast rollback indexing, and trailing residual ADD for decode & verify (n_seq_tokens <= 32).
+struct inkling_conv_fused_args {
+    uint32_t channels;
+    uint32_t n_seq_tokens;
+    uint32_t n_seqs;
+    uint32_t hist_ch_total;
+    uint32_t ch_offset;
+    uint32_t kw;
+    uint32_t row_floats;
+    uint32_t state_base;
+    uint32_t slot_stride;
+    uint32_t taps_by_head;
+    uint32_t has_residual;
+    float    scale;
+};
+
+kernel void kernel_inkling_conv_fused(
+        constant inkling_conv_fused_args & args [[buffer(0)]],
+        device const float  * cur               [[buffer(1)]],
+        device const float4 * weights           [[buffer(2)]],
+        device const float  * history           [[buffer(3)]],
+        device       float  * state             [[buffer(4)]],
+        device const float  * dynamic           [[buffer(5)]],
+        device const float  * residual          [[buffer(6)]],
+        device       float  * output            [[buffer(7)]],
+        uint2 gid [[thread_position_in_grid]]) {
+    const uint ch  = gid.x;
+    const uint seq = gid.y;
+    if (ch >= args.channels || seq >= args.n_seqs) { return; }
+
+    const float4 w = weights[ch];
+    const uint64_t hist_off = ((uint64_t)seq * args.hist_ch_total + (uint64_t)(args.ch_offset + ch)) * 3u;
+    float h0 = history[hist_off + 0u];
+    float h1 = history[hist_off + 1u];
+    float h2 = history[hist_off + 2u];
+
+    const uint n_st = args.n_seq_tokens;
+    const uint kw   = args.kw;
+    const uint taps = args.taps_by_head;
+    const uint head = taps ? (ch / (args.channels / (taps / 4u))) : 0u;
+    const uint64_t st_seq_base = (uint64_t)args.state_base + (uint64_t)seq * args.row_floats + (uint64_t)ch * 3u;
+
+    for (uint t = 0; t < n_st; ++t) {
+        const uint tok = seq * n_st + t;
+        const uint64_t idx = (uint64_t)tok * args.channels + ch;
+        const float x_t = cur[idx];
+        const float4 sample = float4(h0, h1, h2, x_t);
+        float result = dot(sample, w);
+        if (taps) {
+            #pragma clang fp contract(off)
+            #pragma clang fp reassociate(off)
+            const uint64_t dbase = (uint64_t)tok * taps + head * 4u;
+            result = result + sample[3] * dynamic[dbase + 0u];
+            result = result + sample[2] * dynamic[dbase + 1u];
+            result = result + sample[1] * dynamic[dbase + 2u];
+            result = result + sample[0] * dynamic[dbase + 3u];
+        }
+        float y = (x_t + result) * args.scale;
+        if (args.has_residual) {
+            y += residual[idx];
+        }
+        output[idx] = y;
+
+        h0 = h1;
+        h1 = h2;
+        h2 = x_t;
+
+        if (t + kw >= n_st) {
+            const uint s_idx = (n_st - 1u) - t;
+            const uint64_t dst_st = st_seq_base + (uint64_t)s_idx * args.slot_stride;
+            state[dst_st + 0u] = h0;
+            state[dst_st + 1u] = h1;
+            state[dst_st + 2u] = h2;
+        }
+    }
+}
+
 typedef void (im2col_t)(
         constant ggml_metal_kargs_im2col & args,
         device const float * x,

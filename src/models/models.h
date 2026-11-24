@@ -2534,7 +2534,8 @@ struct llama_model_inkling2 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llm_graph_params & params);
         ggml_tensor * mix(const std::vector<ggml_tensor *> & blocks, ggml_tensor * cur, ggml_tensor * query,
-                bool * out_fused = nullptr);
+                bool * out_fused = nullptr, ggml_tensor * const * norm_weights = nullptr,
+                float norm_eps = 1e-6f, bool * out_normed = nullptr);
         ggml_tensor * clip(ggml_tensor * cur, ggml_tensor * scale, float threshold);
         ggml_tensor * convolve(
                 ggml_tensor * cur,
@@ -2543,7 +2544,9 @@ struct llama_model_inkling2 : public llama_model_base {
                 ggml_tensor * state,
                 ggml_tensor * history,
                 llm_graph_input_rs * inp,
-                int64_t offset);
+                int64_t offset,
+                ggml_tensor * residual = nullptr,
+                bool * out_residual_fused = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
 
     protected:
@@ -2567,6 +2570,7 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_backend_t inkling_dense_backend = nullptr;
         ggml_tensor * (*control_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*mix_kernel)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *) = nullptr;
+        ggml_tensor * (*mix_norm_kernel)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *, ggml_tensor * const *, float) = nullptr;
         ggml_tensor * (*ctrl_down_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*ctrl_apply_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*mul_sigmoid_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *) = nullptr;
@@ -2574,6 +2578,8 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * (*clip_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, float) = nullptr;
         ggml_tensor * (*rel_mask_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*conv_residual_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float) = nullptr;
+        ggml_tensor * (*conv_fused_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
+                ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float) = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

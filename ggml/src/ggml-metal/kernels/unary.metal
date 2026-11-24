@@ -45,6 +45,8 @@ struct inkling_mix_args {
     uint  n_q;
     float eps;
     float scale;
+    uint  has_norm;
+    float norm_eps;
 };
 
 kernel void kernel_inkling_mix(
@@ -59,6 +61,9 @@ kernel void kernel_inkling_mix(
         device const float4 * s5         [[buffer(8)]],
         device const float4 * s6         [[buffer(9)]],
         device const float4 * s7         [[buffer(10)]],
+        device const float4 * nw0        [[buffer(11)]],
+        device const float4 * nw1        [[buffer(12)]],
+        device const float4 * nw2        [[buffer(13)]],
         uint   t     [[threadgroup_position_in_grid]],
         ushort tid   [[thread_index_in_threadgroup]],
         ushort lane  [[thread_index_in_simdgroup]],
@@ -123,16 +128,51 @@ kernel void kernel_inkling_mix(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     const ulong stride_q = ulong(args.n_tokens) * n4;
-    for (uint i = tid; i < n4; i += 256u) {
-        float4 acc[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
-        for (uint k = 0; k < args.n_states; ++k) {
-            const float4 v = st[k][row_off + i];
+    if (!args.has_norm) {
+        for (uint i = tid; i < n4; i += 256u) {
+            float4 acc[4] = { float4(0.0f), float4(0.0f), float4(0.0f), float4(0.0f) };
+            for (uint k = 0; k < args.n_states; ++k) {
+                const float4 v = st[k][row_off + i];
+                for (uint q = 0; q < args.n_q; ++q) {
+                    acc[q] = fma(float4(sh_w[q][k]), v, acc[q]);
+                }
+            }
             for (uint q = 0; q < args.n_q; ++q) {
-                acc[q] = fma(float4(sh_w[q][k]), v, acc[q]);
+                dst[ulong(q) * stride_q + row_off + i] = acc[q];
             }
         }
+    } else {
+        device const float4 * nws[3] = { nw0, nw1, nw2 };
         for (uint q = 0; q < args.n_q; ++q) {
-            dst[ulong(q) * stride_q + row_off + i] = acc[q];
+            float4 vals[4];
+            float sq = 0.0f;
+            uint m = 0;
+            for (uint i = tid; i < n4; i += 256u, ++m) {
+                float4 a = float4(0.0f);
+                for (uint k = 0; k < args.n_states; ++k) {
+                    a = fma(float4(sh_w[q][k]), st[k][row_off + i], a);
+                }
+                vals[m] = a;
+                sq += dot(a, a);
+            }
+            sq = simd_sum(sq);
+            if (lane == 0) { sh_red[0][sg] = sq; }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (tid == 0) {
+                float tot_sq = 0.0f;
+                for (uint j = 0; j < 8u; ++j) { tot_sq += sh_red[0][j]; }
+                sh_inv[0] = rsqrt(tot_sq / float(args.n_embd) + args.norm_eps);
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            const float inv_n = sh_inv[0];
+            device const float4 * nw = nws[q];
+            m = 0;
+            for (uint i = tid; i < n4; i += 256u, ++m) {
+                dst[ulong(q) * stride_q + row_off + i] = vals[m] * inv_n * nw[i];
+            }
+            if (q + 1u < args.n_q) {
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
         }
     }
 }

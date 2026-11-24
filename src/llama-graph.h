@@ -785,6 +785,8 @@ struct llm_inkling_flash_attention {
     ggml_backend_t backend = nullptr;
     ggml_tensor * (*create)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
             ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, int32_t, int32_t) = nullptr;
+    ggml_tensor * (*create_gated)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
+            ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, int32_t, int32_t) = nullptr;
 };
 
 // hybrid iswa memory with a per-head attention bias that depends on the distance from the query to the cell (Inkling)
@@ -1594,7 +1596,9 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
                   float   kq_scale,
                     int   il,
-                   bool   prebuilt_mask = false) const;
+                   bool   prebuilt_mask = false,
+            ggml_tensor * flash_gate = nullptr,
+                   bool * out_gate_fused = nullptr) const;
 
     //
     // pooling

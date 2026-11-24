@@ -20,7 +20,12 @@ namespace {
 using fa_ready_fn = bool (*)(ggml_backend_t, int64_t, ggml_type);
 using fa_create_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
         ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, int32_t, int32_t);
+using fa_gated_create_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
+        ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float, int32_t, int32_t);
 using mix_create_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *);
+using mix_norm_create_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor * const *, int, ggml_tensor *, ggml_tensor * const *, float);
+using conv_fused_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
+        ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float);
 using ctrl_down_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 using ctrl_apply_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *);
 using mul_sigmoid_fn = ggml_tensor * (*)(ggml_context *, ggml_tensor *, ggml_tensor *);
@@ -607,6 +612,278 @@ int main(int argc, char ** argv) {
                 }, chained, sizeof(chained));
                 t.assert_true(chained[0] == -1 && chained[1] == 777);
             }
+        }
+    });
+
+    t.test("inkling_flash_attn_v2 gated decode (nwg=1 & nwg=4, f16/q8_0/q4_0)", [&](testing & t) {
+        auto create_gated = reinterpret_cast<fa_gated_create_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_flash_attn_v2"));
+        t.assert_true(create_gated != nullptr);
+
+        for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
+            for (auto [n_q, n_kv] : std::vector<std::pair<int64_t, int64_t>>{{1, 256}, {5, 1024}}) {
+                const int32_t extent = 64;
+                const int32_t n_swa = 0;
+                const float scale = 1.0f / std::sqrt(128.0f);
+                auto q_v   = rand_vec(128 * 24 * n_q, 601, -0.5f, 0.5f);
+                auto k_raw = rand_vec(128 * 8 * n_kv, 602, -0.5f, 0.5f);
+                auto v_raw = rand_vec(128 * 8 * n_kv, 603, -0.5f, 0.5f);
+                auto tbl_v = rand_vec(extent * 24 * n_q, 604, -0.5f, 0.5f);
+                auto snk_v = rand_vec(24 * n_q, 605, -0.5f, 0.5f);
+                auto gat_v = rand_vec(3072 * n_q, 606, -3.0f, 3.0f);
+
+                std::vector<int32_t> q_pos(2 * n_q);
+                for (int64_t i = 0; i < n_q; ++i) {
+                    q_pos[2 * i + 0] = (int32_t) (n_kv - n_q + i);
+                    q_pos[2 * i + 1] = 0;
+                }
+                std::vector<int32_t> k_pos(3 * n_kv);
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    k_pos[3 * i + 0] = (int32_t) i;
+                    k_pos[3 * i + 1] = 1;
+                    k_pos[3 * i + 2] = 0;
+                }
+
+                std::vector<uint8_t> k_bytes, v_bytes;
+                std::vector<float> k_ref, v_ref;
+                quantize_and_dequant(kv_type, k_raw, 8 * n_kv, 128, k_bytes, k_ref);
+                quantize_and_dequant(kv_type, v_raw, 8 * n_kv, 128, v_bytes, v_ref);
+
+                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                auto * tq   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, n_q);
+                auto * tk   = ggml_new_tensor_3d(ctx.get(), kv_type, 128, 8, n_kv);
+                auto * tv   = ggml_new_tensor_3d(ctx.get(), kv_type, 128, 8, n_kv);
+                auto * ttbl = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, extent, 24, n_q);
+                auto * tsnk = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, n_q);
+                auto * tqp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_q);
+                auto * tkp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, n_kv);
+                auto * tgat = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 3072, n_q);
+                auto * out  = create_gated(ctx.get(), tq, tk, tv, ttbl, tsnk, tqp, tkp, tgat, scale, extent, n_swa);
+                t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+                std::vector<float> got(3072 * n_q);
+                run_graph(ctx.get(), out, {
+                    {tq,   {q_v.data(),     q_v.size() * sizeof(float)}},
+                    {tk,   {k_bytes.data(), k_bytes.size()}},
+                    {tv,   {v_bytes.data(), v_bytes.size()}},
+                    {ttbl, {tbl_v.data(),   tbl_v.size() * sizeof(float)}},
+                    {tsnk, {snk_v.data(),   snk_v.size() * sizeof(float)}},
+                    {tqp,  {q_pos.data(),   q_pos.size() * sizeof(int32_t)}},
+                    {tkp,  {k_pos.data(),   k_pos.size() * sizeof(int32_t)}},
+                    {tgat, {gat_v.data(),   gat_v.size() * sizeof(float)}},
+                }, got.data(), got.size() * sizeof(float));
+
+                auto ref = cpu_ref_inkling_fa(q_v, k_ref, v_ref, tbl_v, snk_v, q_pos, k_pos, n_q, n_kv, extent, n_swa, scale);
+                for (size_t i = 0; i < ref.size(); ++i) {
+                    ref[i] *= 1.0f / (1.0f + std::exp(-gat_v[i]));
+                }
+                const float tol = kv_type == GGML_TYPE_F16 ? 2e-3f : 5e-3f;
+                t.assert_true(max_abs_diff(got, ref) < tol);
+            }
+        }
+    });
+
+    t.test("inkling_mix_norm_v1 parity (n_q=1 and n_q=3, n_embd=3072)", [&](testing & t) {
+        auto create = reinterpret_cast<mix_norm_create_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_mix_norm_v1"));
+        t.assert_true(create != nullptr);
+
+        for (auto [n_st, n_q] : std::vector<std::pair<int, int>>{{5, 1}, {4, 3}}) {
+            const int64_t n_embd = 3072, n_tok = 4;
+            const float norm_eps = 1e-6f;
+            std::vector<std::vector<float>> st_v(n_st);
+            for (int k = 0; k < n_st; ++k) {
+                st_v[k] = rand_vec(n_embd * n_tok, 700 + k, -2.0f, 2.0f);
+            }
+            auto q_v = rand_vec(n_embd * n_q, 750, -0.5f, 0.5f);
+            std::vector<std::vector<float>> nw_v(n_q);
+            for (int q = 0; q < n_q; ++q) {
+                nw_v[q] = rand_vec(n_embd, 760 + q, 0.5f, 1.5f);
+            }
+
+            ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+            std::vector<ggml_tensor *> st_t(n_st), nw_t(n_q);
+            std::vector<std::pair<ggml_tensor *, std::pair<const void *, size_t>>> uploads;
+            for (int k = 0; k < n_st; ++k) {
+                st_t[k] = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_tok);
+                uploads.push_back({st_t[k], {st_v[k].data(), st_v[k].size() * sizeof(float)}});
+            }
+            auto * tq = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, n_embd, n_q);
+            uploads.push_back({tq, {q_v.data(), q_v.size() * sizeof(float)}});
+            for (int q = 0; q < n_q; ++q) {
+                nw_t[q] = ggml_new_tensor_1d(ctx.get(), GGML_TYPE_F32, n_embd);
+                uploads.push_back({nw_t[q], {nw_v[q].data(), nw_v[q].size() * sizeof(float)}});
+            }
+            auto * out = create(ctx.get(), st_t.data(), n_st, tq, nw_t.data(), norm_eps);
+            t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+            std::vector<float> got(n_embd * n_tok * n_q);
+            run_graph(ctx.get(), out, uploads, got.data(), got.size() * sizeof(float));
+
+            // CPU reference
+            std::vector<float> ref(n_embd * n_tok * n_q, 0.0f);
+            const float inv_sqrt_d = 1.0f / std::sqrt((float) n_embd);
+            for (int64_t tok = 0; tok < n_tok; ++tok) {
+                std::vector<std::vector<float>> normed(n_st, std::vector<float>(n_embd));
+                for (int k = 0; k < n_st; ++k) {
+                    double sq = 0.0;
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        double v = st_v[k][tok * n_embd + i];
+                        sq += v * v;
+                    }
+                    float inv = 1.0f / std::sqrt((float) (sq / n_embd) + 1e-6f);
+                    for (int64_t i = 0; i < n_embd; ++i) { normed[k][i] = st_v[k][tok * n_embd + i] * inv; }
+                }
+                for (int q = 0; q < n_q; ++q) {
+                    std::vector<float> sc(n_st);
+                    float mx = -1e30f;
+                    for (int k = 0; k < n_st; ++k) {
+                        double d = 0.0;
+                        for (int64_t i = 0; i < n_embd; ++i) { d += (double) normed[k][i] * (double) q_v[q * n_embd + i]; }
+                        sc[k] = (float) d * inv_sqrt_d;
+                        mx = std::max(mx, sc[k]);
+                    }
+                    float sum_e = 0.0f;
+                    for (int k = 0; k < n_st; ++k) { sc[k] = std::exp(sc[k] - mx); sum_e += sc[k]; }
+                    std::vector<float> mixed(n_embd, 0.0f);
+                    double sq = 0.0;
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        double acc = 0.0;
+                        for (int k = 0; k < n_st; ++k) { acc += (double) (sc[k] / sum_e) * (double) normed[k][i]; }
+                        mixed[i] = (float) acc;
+                        sq += acc * acc;
+                    }
+                    float inv_n = 1.0f / std::sqrt((float) (sq / n_embd) + norm_eps);
+                    for (int64_t i = 0; i < n_embd; ++i) {
+                        ref[(q * n_tok + tok) * n_embd + i] = mixed[i] * inv_n * nw_v[q][i];
+                    }
+                }
+            }
+            t.assert_true(max_abs_diff(got, ref) < 1e-4f);
+        }
+    });
+
+    t.test("inkling_conv_fused_v1 parity (rollback slots, dynamic taps, residual add, n_seqs=2)", [&](testing & t) {
+        auto create = reinterpret_cast<conv_fused_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_conv_fused_v1"));
+        t.assert_true(create != nullptr);
+
+        // Test 1: n_seqs=2, n_seq_tokens=5, kw=5 (rollback slots 0..4), dynamic taps + residual add + non-zero ch_offset & head
+        {
+            const int32_t channels = 256, hist_ch = 512, ch_offset = 128;
+            const int32_t n_seq_tokens = 5, n_seqs = 2, n_tokens = n_seq_tokens * n_seqs;
+            const int32_t n_heads = 4, kw = 5, head = 1, n_cells = 4, K_slots = 6;
+            const int32_t row_floats = hist_ch * 3;
+            const float   scale = 1.0f / std::sqrt(9.0f);
+
+            auto cur_v  = rand_vec(channels * n_tokens, 801, -1.0f, 1.0f);
+            auto w_v    = rand_vec(4 * channels, 802, -0.5f, 0.5f);
+            auto hist_v = rand_vec(3 * hist_ch * n_seqs, 803, -1.0f, 1.0f);
+            auto dyn_v  = rand_vec(4 * n_heads * n_tokens, 804, -0.5f, 0.5f);
+            auto res_v  = rand_vec(channels * n_tokens, 805, -1.0f, 1.0f);
+            std::vector<float> state_init(row_floats * n_cells * K_slots, -7.25f);
+            std::vector<float> state_ref = state_init;
+
+            ggml_context_ptr ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
+            auto * tcur  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, channels, n_tokens);
+            auto * tw    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, channels);
+            auto * thist = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, hist_ch, n_seqs);
+            auto * tst   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, row_floats, n_cells * K_slots);
+            auto * tdyn  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4 * n_heads, n_tokens);
+            auto * tres  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, channels, n_tokens);
+
+            auto * out = create(ctx.get(), tcur, tw, thist, tst, tdyn, tres,
+                    ch_offset, n_seq_tokens, n_seqs, kw, head, n_cells, scale);
+            t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+            ggml_cgraph * gf = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(gf, out);
+            ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            t.assert_true(ggml_gallocr_alloc_graph(allocr, gf));
+            ggml_backend_tensor_set(tcur,  cur_v.data(),      0, cur_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tw,    w_v.data(),        0, w_v.size() * sizeof(float));
+            ggml_backend_tensor_set(thist, hist_v.data(),     0, hist_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tst,   state_init.data(), 0, state_init.size() * sizeof(float));
+            ggml_backend_tensor_set(tdyn,  dyn_v.data(),      0, dyn_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tres,  res_v.data(),      0, res_v.size() * sizeof(float));
+            t.assert_true(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+            std::vector<float> got_out(channels * n_tokens);
+            std::vector<float> got_state(state_init.size());
+            ggml_backend_tensor_get(out, got_out.data(),   0, got_out.size() * sizeof(float));
+            ggml_backend_tensor_get(tst, got_state.data(), 0, got_state.size() * sizeof(float));
+            ggml_gallocr_free(allocr);
+
+            // CPU reference matching build_conv_state_store + convolve + add(residual)
+            std::vector<float> ref_out(channels * n_tokens);
+            for (int32_t s = 0; s < n_seqs; ++s) {
+                for (int32_t ch = 0; ch < channels; ++ch) {
+                    const int32_t h_idx = ch / (channels / n_heads);
+                    const size_t hoff = ((size_t) s * hist_ch + (size_t) (ch_offset + ch)) * 3u;
+                    float h0 = hist_v[hoff + 0], h1 = hist_v[hoff + 1], h2 = hist_v[hoff + 2];
+                    for (int32_t step = 0; step < n_seq_tokens; ++step) {
+                        const int32_t tok = s * n_seq_tokens + step;
+                        const size_t idx = (size_t) tok * channels + ch;
+                        const float xt = cur_v[idx];
+                        float acc = h0 * w_v[ch * 4 + 0] + h1 * w_v[ch * 4 + 1] + h2 * w_v[ch * 4 + 2] + xt * w_v[ch * 4 + 3];
+                        const size_t dbase = (size_t) tok * (4 * n_heads) + (size_t) h_idx * 4;
+                        acc += xt * dyn_v[dbase + 0] + h2 * dyn_v[dbase + 1] + h1 * dyn_v[dbase + 2] + h0 * dyn_v[dbase + 3];
+                        ref_out[idx] = (xt + acc) * scale + res_v[idx];
+                        h0 = h1; h1 = h2; h2 = xt;
+                        if (step + kw >= n_seq_tokens) {
+                            const int32_t s_idx = (n_seq_tokens - 1) - step;
+                            const size_t dst_st = ((size_t) s_idx * n_cells + (size_t) head + (size_t) s) * row_floats
+                                    + (size_t) (ch_offset + ch) * 3u;
+                            state_ref[dst_st + 0] = h0;
+                            state_ref[dst_st + 1] = h1;
+                            state_ref[dst_st + 2] = h2;
+                        }
+                    }
+                }
+            }
+            t.assert_true(max_abs_diff(got_out, ref_out) < 1e-5f);
+            t.assert_true(max_abs_diff(got_state, state_ref) == 0.0f);
+        }
+
+        // Test 2: no dynamic taps, WITH residual (tests packed src[4]=residual without null hole!), kw=1, n_seq_tokens=1
+        {
+            const int32_t channels = 128, hist_ch = 256, ch_offset = 0;
+            const int32_t n_seq_tokens = 1, n_seqs = 1, kw = 1, head = 0, n_cells = 1;
+            const int32_t row_floats = hist_ch * 3;
+            const float   scale = 1.0f / std::sqrt(5.0f);
+            auto cur_v  = rand_vec(channels, 811, -1.0f, 1.0f);
+            auto w_v    = rand_vec(4 * channels, 812, -0.5f, 0.5f);
+            auto hist_v = rand_vec(3 * hist_ch, 813, -1.0f, 1.0f);
+            auto res_v  = rand_vec(channels, 814, -1.0f, 1.0f);
+            std::vector<float> state_init(row_floats, 0.0f);
+
+            ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+            auto * tcur  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, channels, 1);
+            auto * tw    = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 4, channels);
+            auto * thist = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 3, hist_ch, 1);
+            auto * tst   = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, row_floats, 1);
+            auto * tres  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, channels, 1);
+
+            auto * out = create(ctx.get(), tcur, tw, thist, tst, nullptr, tres,
+                    ch_offset, n_seq_tokens, n_seqs, kw, head, n_cells, scale);
+            t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+            std::vector<float> got_out(channels);
+            run_graph(ctx.get(), out, {
+                {tcur,  {cur_v.data(),      cur_v.size() * sizeof(float)}},
+                {tw,    {w_v.data(),        w_v.size() * sizeof(float)}},
+                {thist, {hist_v.data(),     hist_v.size() * sizeof(float)}},
+                {tst,   {state_init.data(), state_init.size() * sizeof(float)}},
+                {tres,  {res_v.data(),      res_v.size() * sizeof(float)}},
+            }, got_out.data(), got_out.size() * sizeof(float));
+
+            std::vector<float> ref_out(channels);
+            for (int32_t ch = 0; ch < channels; ++ch) {
+                float acc = hist_v[ch * 3 + 0] * w_v[ch * 4 + 0] + hist_v[ch * 3 + 1] * w_v[ch * 4 + 1]
+                          + hist_v[ch * 3 + 2] * w_v[ch * 4 + 2] + cur_v[ch] * w_v[ch * 4 + 3];
+                ref_out[ch] = (cur_v[ch] + acc) * scale + res_v[ch];
+            }
+            t.assert_true(max_abs_diff(got_out, ref_out) < 1e-5f);
         }
     });
 

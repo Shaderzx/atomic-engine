@@ -1142,6 +1142,47 @@ static ggml_tensor * ggml_backend_metal_inkling_mix_v1(ggml_context * ctx,
     return node;
 }
 
+static ggml_tensor * ggml_backend_metal_inkling_mix_norm_v1(ggml_context * ctx,
+        ggml_tensor * const * states, int n_states, ggml_tensor * query,
+        ggml_tensor * const * norm_weights, float norm_eps) {
+    if (!states || !query || !norm_weights || !std::isfinite(norm_eps) || norm_eps < 0.0f ||
+            n_states < 1 || n_states > GGML_METAL_INKLING_MIX_MAX_STATES ||
+            query->type != GGML_TYPE_F32 || !ggml_is_contiguous(query) ||
+            query->ne[0] <= 0 || query->ne[0] > 4096 || query->ne[0] % 4 != 0 ||
+            query->ne[1] < 1 || query->ne[1] > 3 || query->ne[2] != 1 || query->ne[3] != 1) {
+        return nullptr;
+    }
+    const int64_t n_embd   = query->ne[0];
+    const int64_t n_q      = query->ne[1];
+    const int64_t n_tokens = states[0] ? states[0]->ne[1] : 0;
+    if (n_tokens <= 0 || n_states + 1 + n_q >= GGML_MAX_SRC) { return nullptr; }
+    ggml_tensor * args[GGML_MAX_SRC] = {};
+    for (int i = 0; i < n_states; ++i) {
+        auto * s = states[i];
+        if (!s || s->type != GGML_TYPE_F32 || !ggml_is_contiguous(s) ||
+                s->ne[0] != n_embd || s->ne[1] != n_tokens || s->ne[2] != 1 || s->ne[3] != 1) {
+            return nullptr;
+        }
+        args[i] = s;
+    }
+    args[n_states] = query;
+    for (int64_t q = 0; q < n_q; ++q) {
+        auto * nw = norm_weights[q];
+        if (!nw || nw->type != GGML_TYPE_F32 || !ggml_is_contiguous(nw) ||
+                nw->ne[0] != n_embd || ggml_nelements(nw) != n_embd) {
+            return nullptr;
+        }
+        args[n_states + 1 + q] = nw;
+    }
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, n_embd, n_tokens, n_q, 1, args, n_states + 1 + (int)n_q,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling depth mix+norm requires Metal"); }, 1, nullptr);
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4, norm_eps);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3] = n_states;
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2] = int32_t(n_q);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_MIX_NORM;
+    return node;
+}
+
 static ggml_tensor * ggml_backend_metal_inkling_ctrl_down_v1(ggml_context * ctx,
         ggml_tensor * cur, ggml_tensor * message, ggml_tensor * w_down) {
     if (!cur || !message || !w_down ||
@@ -1351,10 +1392,10 @@ static bool ggml_backend_metal_inkling_flash_attn_ready_v1(ggml_backend_t backen
     return n_q < 16 || props->has_tensor;
 }
 
-static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx,
+static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v2(ggml_context * ctx,
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * table, ggml_tensor * sinks, ggml_tensor * q_pos, ggml_tensor * k_pos,
-        float scale, int32_t extent, int32_t n_swa) {
+        ggml_tensor * gate, float scale, int32_t extent, int32_t n_swa) {
     if (!q || !k || !v || !table || !sinks || !q_pos || !k_pos ||
             extent <= 0 || n_swa < 0 || q->ne[2] <= 0 || k->ne[2] <= 0 ||
             q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 24 || q->ne[3] != 1 || !ggml_is_contiguous(q) ||
@@ -1367,18 +1408,81 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx
             k_pos->type != GGML_TYPE_I32 || k_pos->ne[0] != 3 || k_pos->ne[1] != k->ne[2] || k_pos->ne[2] != 1 || k_pos->ne[3] != 1 || !ggml_is_contiguous(k_pos)) {
         return nullptr;
     }
+    if (gate && (q->ne[2] >= 16 || gate->type != GGML_TYPE_F32 || !ggml_is_contiguous(gate) ||
+            gate->ne[0] != q->ne[0] * q->ne[1] || gate->ne[1] != q->ne[2] ||
+            gate->ne[2] != 1 || gate->ne[3] != 1)) {
+        return nullptr;
+    }
     const size_t expected_nb1 = ggml_row_size(k->type, 128);
     if (k->nb[1] != expected_nb1 || v->nb[1] != expected_nb1) {
         return nullptr;
     }
-    ggml_tensor * args[] = {q, k, v, table, sinks, q_pos, k_pos};
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, q->ne[0]*q->ne[1], q->ne[2], 1, 1, args, 7,
+    ggml_tensor * args[] = {q, k, v, table, sinks, q_pos, k_pos, gate};
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, q->ne[0]*q->ne[1], q->ne[2], 1, 1, args, gate ? 8 : 7,
             +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused flash attention requires Metal"); }, 1, nullptr);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4] = n_swa;
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3] = extent;
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, scale);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_FLASH_ATTN;
-    ggml_set_name(node, "inkling_flash_attention");
+    ggml_set_name(node, gate ? "inkling_flash_attention_gated" : "inkling_flash_attention");
+    return node;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx,
+        ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
+        ggml_tensor * table, ggml_tensor * sinks, ggml_tensor * q_pos, ggml_tensor * k_pos,
+        float scale, int32_t extent, int32_t n_swa) {
+    return ggml_backend_metal_inkling_flash_attn_v2(ctx, q, k, v, table, sinks, q_pos, k_pos, nullptr, scale, extent, n_swa);
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx,
+        ggml_tensor * cur, ggml_tensor * weights, ggml_tensor * history, ggml_tensor * state,
+        ggml_tensor * dynamic, ggml_tensor * residual,
+        int32_t ch_offset, int32_t n_seq_tokens, int32_t n_seqs,
+        int32_t kw, int32_t head, int32_t n_cells, float scale) {
+    if (!cur || !weights || !history || !state || !std::isfinite(scale) ||
+            ch_offset < 0 || n_seq_tokens <= 0 || n_seq_tokens > 32 || n_seqs <= 0 ||
+            kw <= 0 || kw > n_seq_tokens || head < 0 || n_cells <= 0 ||
+            cur->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 ||
+            history->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(cur) || !ggml_is_contiguous(weights) ||
+            !ggml_is_contiguous(history) || !ggml_is_contiguous(state) ||
+            cur->ne[0] <= 0 || cur->ne[1] != (int64_t)n_seq_tokens * (int64_t)n_seqs ||
+            cur->ne[2] != 1 || cur->ne[3] != 1 ||
+            weights->ne[0] != 4 || ggml_nrows(weights) != cur->ne[0] ||
+            history->ne[0] != 3 || history->ne[2] != (int64_t)n_seqs || history->ne[3] != 1 ||
+            (int64_t)ch_offset + cur->ne[0] > history->ne[1] ||
+            (state->nb[1] % sizeof(float)) != 0 ||
+            ((int64_t)ch_offset + cur->ne[0]) * 3 > (int64_t)(state->nb[1] / sizeof(float)) ||
+            (int64_t)head + (int64_t)n_seqs > (int64_t)n_cells ||
+            (int64_t)(kw - 1) * (int64_t)n_cells + (int64_t)head + (int64_t)n_seqs > state->ne[1]) {
+        return nullptr;
+    }
+    if (dynamic && (dynamic->type != GGML_TYPE_F32 || !ggml_is_contiguous(dynamic) ||
+            dynamic->ne[1] != cur->ne[1] || dynamic->ne[2] != 1 || dynamic->ne[3] != 1 ||
+            dynamic->ne[0] <= 0 || (dynamic->ne[0] % 4) != 0 || (cur->ne[0] % (dynamic->ne[0] / 4)) != 0)) {
+        return nullptr;
+    }
+    if (residual && (residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
+            !ggml_are_same_shape(residual, cur))) {
+        return nullptr;
+    }
+    ggml_tensor * args[6] = { cur, weights, history, state, nullptr, nullptr };
+    int n_args = 4;
+    uint32_t flags = 0;
+    if (dynamic)  { args[n_args++] = dynamic;  flags |= 1u; }
+    if (residual) { args[n_args++] = residual; flags |= 2u; }
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1], 1, 1, args, n_args,
+            +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused conv requires Metal"); }, 1, nullptr);
+    node->op_params[0] = ch_offset;
+    node->op_params[1] = n_seq_tokens;
+    node->op_params[2] = n_seqs;
+    node->op_params[3] = kw;
+    node->op_params[4] = head;
+    node->op_params[5] = n_cells;
+    node->op_params[6] = (int32_t)flags;
+    ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, scale);
+    node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_CONV_FUSED;
     return node;
 }
 
@@ -1468,6 +1572,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     if (strcmp(name, "ggml_backend_metal_inkling_flash_attn_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_flash_attn_v1;
     }
+    if (strcmp(name, "ggml_backend_metal_inkling_flash_attn_v2") == 0) {
+        return (void *) ggml_backend_metal_inkling_flash_attn_v2;
+    }
     if (strcmp(name, "ggml_backend_metal_inkling_flash_attn_ready_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_flash_attn_ready_v1;
     }
@@ -1488,6 +1595,12 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_mix_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_mix_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_mix_norm_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_mix_norm_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_conv_fused_v1") == 0) {
+        return (void *) ggml_backend_metal_inkling_conv_fused_v1;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_ctrl_down_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_ctrl_down_v1;

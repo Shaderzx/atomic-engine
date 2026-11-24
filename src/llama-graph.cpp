@@ -3953,7 +3953,10 @@ static ggml_tensor * build_attn_iswa_impl(
         ggml_tensor * flash_q_pos = nullptr,
         ggml_tensor * flash_k_pos = nullptr,
         int32_t       flash_extent = 0,
-        int32_t       flash_n_swa = 0) {
+        int32_t       flash_n_swa = 0,
+        ggml_tensor * flash_gate = nullptr,
+        bool        * out_gate_fused = nullptr) {
+    if (out_gate_fused) { *out_gate_fused = false; }
     ggml_context * ctx0 = gctx.ctx0;
     ggml_cgraph  * gf   = gctx.gf;
 
@@ -4021,13 +4024,27 @@ static ggml_tensor * build_attn_iswa_impl(
 
     ggml_tensor * cur = nullptr;
     if (flash && flash->create) {
-        cur = flash->create(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos, kq_scale, flash_extent, flash_n_swa);
-        if (cur && ggml_backend_supports_op(flash->backend, cur)) {
-            ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
-        } else {
-            cur = nullptr;
-            if (!kq_mask) {
-                throw std::runtime_error("Inkling fused flash attention rejected a layer after omitting dense kq_mask");
+        const bool can_fuse_gate = flash_gate && flash->create_gated && q->ne[2] < 16 &&
+                !v_rot && mctx_cur->get_v_scale(il) == nullptr;
+        if (can_fuse_gate) {
+            cur = flash->create_gated(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos,
+                    flash_gate, kq_scale, flash_extent, flash_n_swa);
+            if (cur && ggml_backend_supports_op(flash->backend, cur)) {
+                ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
+                if (out_gate_fused) { *out_gate_fused = true; }
+            } else {
+                cur = nullptr;
+            }
+        }
+        if (!cur) {
+            cur = flash->create(ctx0, q, k, v, flash_table, flash_sinks, flash_q_pos, flash_k_pos, kq_scale, flash_extent, flash_n_swa);
+            if (cur && ggml_backend_supports_op(flash->backend, cur)) {
+                ggml_backend_sched_set_tensor_backend(gctx.sched, cur, flash->backend);
+            } else {
+                cur = nullptr;
+                if (!kq_mask) {
+                    throw std::runtime_error("Inkling fused flash attention rejected a layer after omitting dense kq_mask");
+                }
             }
         }
     }
@@ -4700,7 +4717,10 @@ ggml_tensor * llm_graph_context::build_attn(
         ggml_tensor * sinks,
             float     kq_scale,
             int       il,
-            bool      prebuilt_mask) const {
+            bool      prebuilt_mask,
+        ggml_tensor * flash_gate,
+            bool    * out_gate_fused) const {
+    if (out_gate_fused) { *out_gate_fused = false; }
     const bool is_swa = hparams.is_swa(il);
 
     auto * inp_attn = inp->get_attn();
@@ -4711,7 +4731,8 @@ ggml_tensor * llm_graph_context::build_attn(
         const int32_t n_swa  = is_swa ? (int32_t)hparams.n_swa : 0;
         return build_attn_iswa_impl(*this, inp_attn, wo, wo_b, wo_s, q_cur, k_cur, v_cur,
                 nullptr, nullptr, nullptr, nullptr, nullptr, kq_scale, il, nullptr,
-                &inp->flash_attention, kq_b, sinks, inp->self_q_pos, k_pos, extent, n_swa);
+                &inp->flash_attention, kq_b, sinks, inp->self_q_pos, k_pos, extent, n_swa,
+                flash_gate, out_gate_fused);
     }
 
     const auto & attn_mask = is_swa ? inp_attn->self_attn_mask_swa : inp_attn->self_attn_mask;
