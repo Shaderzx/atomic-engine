@@ -2546,7 +2546,8 @@ struct llama_model_inkling2 : public llama_model_base {
                 llm_graph_input_rs * inp,
                 int64_t offset,
                 ggml_tensor * residual = nullptr,
-                bool * out_residual_fused = nullptr);
+                bool * out_residual_fused = nullptr,
+                ggml_tensor * exp_weights = nullptr);
         ggml_tensor * control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl);
 
     protected:
@@ -2579,7 +2580,7 @@ struct llama_model_inkling2 : public llama_model_base {
         ggml_tensor * (*rel_mask_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *) = nullptr;
         ggml_tensor * (*conv_residual_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *, float) = nullptr;
         ggml_tensor * (*conv_fused_kernel)(ggml_context *, ggml_tensor *, ggml_tensor *, ggml_tensor *, ggml_tensor *,
-                ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float) = nullptr;
+                ggml_tensor *, ggml_tensor *, ggml_tensor *, int32_t, int32_t, int32_t, int32_t, int32_t, int32_t, float) = nullptr;
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

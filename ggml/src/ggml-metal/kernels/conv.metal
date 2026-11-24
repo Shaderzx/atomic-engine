@@ -43,6 +43,7 @@ struct inkling_conv_fused_args {
     uint32_t slot_stride;
     uint32_t taps_by_head;
     uint32_t has_residual;
+    uint32_t n_experts;
     float    scale;
 };
 
@@ -55,6 +56,7 @@ kernel void kernel_inkling_conv_fused(
         device const float  * dynamic           [[buffer(5)]],
         device const float  * residual          [[buffer(6)]],
         device       float  * output            [[buffer(7)]],
+        device const float  * exp_weights       [[buffer(8)]],
         uint2 gid [[thread_position_in_grid]]) {
     const uint ch  = gid.x;
     const uint seq = gid.y;
@@ -75,7 +77,18 @@ kernel void kernel_inkling_conv_fused(
     for (uint t = 0; t < n_st; ++t) {
         const uint tok = seq * n_st + t;
         const uint64_t idx = (uint64_t)tok * args.channels + ch;
-        const float x_t = cur[idx];
+        float x_t;
+        if (args.n_experts > 0u) {
+            const uint ne = args.n_experts;
+            float sum_e = 0.0f;
+            const uint64_t e_base = (uint64_t)tok * ne;
+            for (uint e = 0; e < ne; ++e) {
+                sum_e += cur[(e_base + e) * args.channels + ch] * exp_weights[e_base + e];
+            }
+            x_t = sum_e;
+        } else {
+            x_t = cur[idx];
+        }
         const float4 sample = float4(h0, h1, h2, x_t);
         float result = dot(sample, w);
         if (taps) {

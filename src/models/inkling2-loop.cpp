@@ -116,7 +116,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             }
             if (use_conv_fused) {
                 conv_fused_kernel = reinterpret_cast<decltype(conv_fused_kernel)>(
-                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_conv_fused_v1"));
+                    ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_conv_fused_v2"));
             }
             if (use_ctrl_full) {
                 ctrl_down_kernel = reinterpret_cast<decltype(ctrl_down_kernel)>(
@@ -208,6 +208,7 @@ llama_model_inkling2_loop::graph::graph(const llm_graph_params & params) : llama
             const auto & loop = m.loop_layers[ip - start];
             bool msg_fused = false;
             auto * msg = mix(bank, bank_out, loop.msg_query, &msg_fused);
+            ggml_build_forward_expand(gf, msg);
             cur = build_layer(il, ip, cur, blocks, msg, &loop, msg_fused);
         }
     }

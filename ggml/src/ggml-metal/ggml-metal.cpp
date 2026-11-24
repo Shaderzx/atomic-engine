@@ -1435,11 +1435,15 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v1(ggml_context * ctx
     return ggml_backend_metal_inkling_flash_attn_v2(ctx, q, k, v, table, sinks, q_pos, k_pos, nullptr, scale, extent, n_swa);
 }
 
-static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx,
+static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v2(ggml_context * ctx,
         ggml_tensor * cur, ggml_tensor * weights, ggml_tensor * history, ggml_tensor * state,
-        ggml_tensor * dynamic, ggml_tensor * residual,
+        ggml_tensor * dynamic, ggml_tensor * residual, ggml_tensor * exp_weights,
         int32_t ch_offset, int32_t n_seq_tokens, int32_t n_seqs,
         int32_t kw, int32_t head, int32_t n_cells, float scale) {
+    const int64_t n_tokens = (int64_t)n_seq_tokens * (int64_t)n_seqs;
+    const bool cur_shape_ok = cur && (exp_weights
+            ? (cur->ne[0] > 0 && cur->ne[1] > 0 && cur->ne[2] == n_tokens && cur->ne[3] == 1)
+            : (cur->ne[0] > 0 && cur->ne[1] == n_tokens && cur->ne[2] == 1 && cur->ne[3] == 1));
     if (!cur || !weights || !history || !state || !std::isfinite(scale) ||
             ch_offset < 0 || n_seq_tokens <= 0 || n_seq_tokens > 32 || n_seqs <= 0 ||
             kw <= 0 || kw > n_seq_tokens || head < 0 || n_cells <= 0 ||
@@ -1447,8 +1451,7 @@ static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx
             history->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
             !ggml_is_contiguous(cur) || !ggml_is_contiguous(weights) ||
             !ggml_is_contiguous(history) || !ggml_is_contiguous(state) ||
-            cur->ne[0] <= 0 || cur->ne[1] != (int64_t)n_seq_tokens * (int64_t)n_seqs ||
-            cur->ne[2] != 1 || cur->ne[3] != 1 ||
+            !cur_shape_ok ||
             weights->ne[0] != 4 || ggml_nrows(weights) != cur->ne[0] ||
             history->ne[0] != 3 || history->ne[2] != (int64_t)n_seqs || history->ne[3] != 1 ||
             (int64_t)ch_offset + cur->ne[0] > history->ne[1] ||
@@ -1459,20 +1462,26 @@ static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx
         return nullptr;
     }
     if (dynamic && (dynamic->type != GGML_TYPE_F32 || !ggml_is_contiguous(dynamic) ||
-            dynamic->ne[1] != cur->ne[1] || dynamic->ne[2] != 1 || dynamic->ne[3] != 1 ||
+            dynamic->ne[1] != n_tokens || dynamic->ne[2] != 1 || dynamic->ne[3] != 1 ||
             dynamic->ne[0] <= 0 || (dynamic->ne[0] % 4) != 0 || (cur->ne[0] % (dynamic->ne[0] / 4)) != 0)) {
         return nullptr;
     }
     if (residual && (residual->type != GGML_TYPE_F32 || !ggml_is_contiguous(residual) ||
-            !ggml_are_same_shape(residual, cur))) {
+            residual->ne[0] != cur->ne[0] || residual->ne[1] != n_tokens ||
+            residual->ne[2] != 1 || residual->ne[3] != 1)) {
         return nullptr;
     }
-    ggml_tensor * args[6] = { cur, weights, history, state, nullptr, nullptr };
+    if (exp_weights && (exp_weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(exp_weights) ||
+            ggml_nelements(exp_weights) != cur->ne[1] * n_tokens)) {
+        return nullptr;
+    }
+    ggml_tensor * args[7] = { cur, weights, history, state, nullptr, nullptr, nullptr };
     int n_args = 4;
     uint32_t flags = 0;
-    if (dynamic)  { args[n_args++] = dynamic;  flags |= 1u; }
-    if (residual) { args[n_args++] = residual; flags |= 2u; }
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], cur->ne[1], 1, 1, args, n_args,
+    if (dynamic)     { args[n_args++] = dynamic;     flags |= 1u; }
+    if (residual)    { args[n_args++] = residual;    flags |= 2u; }
+    if (exp_weights) { args[n_args++] = exp_weights; flags |= 4u; }
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], n_tokens, 1, 1, args, n_args,
             +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused conv requires Metal"); }, 1, nullptr);
     node->op_params[0] = ch_offset;
     node->op_params[1] = n_seq_tokens;
@@ -1484,6 +1493,15 @@ static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, scale);
     node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] = GGML_METAL_INKLING_CONV_FUSED;
     return node;
+}
+
+static ggml_tensor * ggml_backend_metal_inkling_conv_fused_v1(ggml_context * ctx,
+        ggml_tensor * cur, ggml_tensor * weights, ggml_tensor * history, ggml_tensor * state,
+        ggml_tensor * dynamic, ggml_tensor * residual,
+        int32_t ch_offset, int32_t n_seq_tokens, int32_t n_seqs,
+        int32_t kw, int32_t head, int32_t n_cells, float scale) {
+    return ggml_backend_metal_inkling_conv_fused_v2(ctx, cur, weights, history, state,
+            dynamic, residual, nullptr, ch_offset, n_seq_tokens, n_seqs, kw, head, n_cells, scale);
 }
 
 static ggml_tensor * ggml_backend_metal_inkling_conv_residual_v1(ggml_context * ctx, ggml_tensor * cur,
@@ -1601,6 +1619,9 @@ static void * ggml_backend_metal_get_proc_address(ggml_backend_reg_t reg, const 
     }
     if (strcmp(name, "ggml_backend_metal_inkling_conv_fused_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_conv_fused_v1;
+    }
+    if (strcmp(name, "ggml_backend_metal_inkling_conv_fused_v2") == 0) {
+        return (void *) ggml_backend_metal_inkling_conv_fused_v2;
     }
     if (strcmp(name, "ggml_backend_metal_inkling_ctrl_down_v1") == 0) {
         return (void *) ggml_backend_metal_inkling_ctrl_down_v1;

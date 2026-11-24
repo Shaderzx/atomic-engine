@@ -468,8 +468,12 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     const uint32_t flags        = (uint32_t)node->op_params[6];
                     const bool has_dyn          = (flags & 1u) != 0u;
                     const bool has_res          = (flags & 2u) != 0u;
-                    const int  dyn_idx          = has_dyn ? 4 : -1;
-                    const int  res_idx          = has_res ? (has_dyn ? 5 : 4) : -1;
+                    const bool has_ew           = (flags & 4u) != 0u;
+                    int next_idx = 4;
+                    const int  dyn_idx          = has_dyn ? next_idx++ : -1;
+                    const int  res_idx          = has_res ? next_idx++ : -1;
+                    const int  ew_idx           = has_ew  ? next_idx++ : -1;
+                    const uint32_t n_experts    = has_ew ? (uint32_t)node->src[0]->ne[1] : 0u;
                     const float scale           = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
                     const uint32_t row_floats   = (uint32_t)(node->src[3]->nb[1] / sizeof(float));
                     const uint32_t state_base   = head * row_floats + ch_offset * 3u;
@@ -477,12 +481,12 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     const uint32_t taps_by_head = dyn_idx >= 0 ? (uint32_t)node->src[dyn_idx]->ne[0] : 0u;
                     struct {
                         uint32_t channels, n_seq_tokens, n_seqs, hist_ch_total, ch_offset, kw;
-                        uint32_t row_floats, state_base, slot_stride, taps_by_head, has_residual;
+                        uint32_t row_floats, state_base, slot_stride, taps_by_head, has_residual, n_experts;
                         float    scale;
                     } args = {
                         (uint32_t)node->ne[0], n_seq_tokens, n_seqs, (uint32_t)node->src[2]->ne[1],
                         ch_offset, kw, row_floats, state_base, slot_stride, taps_by_head,
-                        has_res ? 1u : 0u, scale,
+                        has_res ? 1u : 0u, n_experts, scale,
                     };
                     ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                     ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
@@ -493,6 +497,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(dyn_idx >= 0 ? node->src[dyn_idx] : node->src[0]), 5);
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(res_idx >= 0 ? node->src[res_idx] : node->src[0]), 6);
                     ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node), 7);
+                    ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(ew_idx  >= 0 ? node->src[ew_idx]  : node->src[0]), 8);
                     const uint32_t threads = 128u;
                     ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (args.channels + threads - 1u) / threads, n_seqs, 1, threads, 1, 1);
                     break;

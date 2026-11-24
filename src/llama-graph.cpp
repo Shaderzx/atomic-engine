@@ -2397,7 +2397,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor ** out_raw_experts,
+         ggml_tensor ** out_expert_weights) const {
     return build_moe_ffn(
         cur,
         gate_inp,  /* gate_inp_b  */ nullptr,
@@ -2420,7 +2422,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         down_exps_s,
         selected_experts_in,
         post_exp_norm,
-        post_exp_norm_eps
+        post_exp_norm_eps,
+        out_raw_experts,
+        out_expert_weights
     );
 }
 
@@ -2450,7 +2454,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * down_exps_s,
          ggml_tensor * selected_experts_in,
          ggml_tensor * post_exp_norm,
-               float   post_exp_norm_eps) const {
+               float   post_exp_norm_eps,
+         ggml_tensor ** out_raw_experts,
+         ggml_tensor ** out_expert_weights) const {
     if (prefill_expert_weights && il >= 0 && il < n_layer) {
         const auto & weights = prefill_expert_weights[il];
         GGML_ASSERT(weights[0] && weights[1] && weights[2]);
@@ -2911,6 +2917,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         experts = ggml_mul(ctx0, experts, post_exp_norm);
         experts = ggml_rms_norm(ctx0, experts, post_exp_norm_eps);
         cb(experts, "ffn_moe_post_exp_norm", il);
+    }
+
+    // Optional zero-copy handoff of un-reduced [n_embd, n_expert_used, n_tokens] experts + weights
+    // so downstream fused kernels (e.g. Inkling ffn_post_conv) can fuse weighted reduction + conv + residual.
+    if (out_raw_experts && out_expert_weights && !weight_before_ffn && !post_exp_norm &&
+            ggml_is_contiguous(experts) && ggml_is_contiguous(weights)) {
+        *out_raw_experts    = experts;
+        *out_expert_weights = weights;
+        return experts;
     }
 
     if (!weight_before_ffn) {

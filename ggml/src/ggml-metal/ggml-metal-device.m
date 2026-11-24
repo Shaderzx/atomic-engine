@@ -1676,8 +1676,15 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     const uint32_t flags        = (uint32_t)op->op_params[6];
                     const bool has_dyn          = (flags & 1u) != 0u;
                     const bool has_res          = (flags & 2u) != 0u;
-                    const int  dyn_idx          = has_dyn ? 4 : -1;
-                    const int  res_idx          = has_res ? (has_dyn ? 5 : 4) : -1;
+                    const bool has_ew           = (flags & 4u) != 0u;
+                    int next_idx = 4;
+                    const int  dyn_idx          = has_dyn ? next_idx++ : -1;
+                    const int  res_idx          = has_res ? next_idx++ : -1;
+                    const int  ew_idx           = has_ew  ? next_idx++ : -1;
+                    const int64_t n_tokens      = (int64_t)n_seq_tokens * (int64_t)n_seqs;
+                    const bool cur_shape_ok = has_ew
+                            ? (cur->ne[0] > 0 && cur->ne[1] > 0 && cur->ne[2] == n_tokens && cur->ne[3] == 1)
+                            : (cur->ne[0] > 0 && cur->ne[1] == n_tokens && cur->ne[2] == 1 && cur->ne[3] == 1);
                     if (!cur || !w || !hist || !state ||
                             cur->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
                             hist->type != GGML_TYPE_F32 || state->type != GGML_TYPE_F32 ||
@@ -1685,8 +1692,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             !ggml_is_contiguous(hist) || !ggml_is_contiguous(state) ||
                             n_seq_tokens == 0 || n_seq_tokens > 32 || n_seqs == 0 ||
                             kw == 0 || kw > n_seq_tokens || n_cells == 0 ||
-                            cur->ne[0] <= 0 || cur->ne[1] != (int64_t)n_seq_tokens * (int64_t)n_seqs ||
-                            cur->ne[2] != 1 || cur->ne[3] != 1 ||
+                            !cur_shape_ok || op->ne[0] != cur->ne[0] || op->ne[1] != n_tokens ||
                             w->ne[0] != 4 || ggml_nrows(w) != cur->ne[0] ||
                             hist->ne[0] != 3 || hist->ne[2] != (int64_t)n_seqs || hist->ne[3] != 1 ||
                             (int64_t)ch_offset + cur->ne[0] > hist->ne[1] ||
@@ -1699,7 +1705,7 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     if (dyn_idx >= 0) {
                         const struct ggml_tensor * dyn = op->src[dyn_idx];
                         if (!dyn || dyn->type != GGML_TYPE_F32 || !ggml_is_contiguous(dyn) ||
-                                dyn->ne[1] != cur->ne[1] || dyn->ne[2] != 1 || dyn->ne[3] != 1 ||
+                                dyn->ne[1] != n_tokens || dyn->ne[2] != 1 || dyn->ne[3] != 1 ||
                                 dyn->ne[0] <= 0 || (dyn->ne[0] % 4) != 0 || (cur->ne[0] % (dyn->ne[0] / 4)) != 0) {
                             return false;
                         }
@@ -1707,7 +1713,14 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                     if (res_idx >= 0) {
                         const struct ggml_tensor * res = op->src[res_idx];
                         if (!res || res->type != GGML_TYPE_F32 || !ggml_is_contiguous(res) ||
-                                !ggml_are_same_shape(res, cur)) {
+                                res->ne[0] != cur->ne[0] || res->ne[1] != n_tokens || res->ne[2] != 1 || res->ne[3] != 1) {
+                            return false;
+                        }
+                    }
+                    if (ew_idx >= 0) {
+                        const struct ggml_tensor * ew = op->src[ew_idx];
+                        if (!ew || ew->type != GGML_TYPE_F32 || !ggml_is_contiguous(ew) ||
+                                ggml_nelements(ew) != cur->ne[1] * n_tokens) {
                             return false;
                         }
                     }
