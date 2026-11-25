@@ -317,7 +317,15 @@ ggml_tensor * llama_model_inkling2::graph::convolve(
 
 // mix a cross-pass message into a looped layer input: (1 - forget)*cur + gain*message, both gated on cur and message
 ggml_tensor * llama_model_inkling2::graph::control(ggml_tensor * cur, ggml_tensor * message, const loop_layer & loop, int ctrl) {
-    if (inkling_dense_backend && ctrl_down_kernel && ctrl_apply_kernel && n_tokens <= 8 && (!loras || loras->empty())) {
+    auto has_lora = [&](ggml_tensor * w) -> bool {
+        if (!loras || !w) { return false; }
+        for (const auto & lora : *loras) {
+            if (lora.second != 0.0f && lora.first->get_weight(w) != nullptr) { return true; }
+        }
+        return false;
+    };
+    if (inkling_dense_backend && ctrl_down_kernel && ctrl_apply_kernel && n_tokens <= 8 &&
+            !has_lora(loop.ctrl_down[ctrl]) && !has_lora(loop.ctrl_gain[ctrl]) && !has_lora(loop.ctrl_forget[ctrl])) {
         if (auto * gate = ctrl_down_kernel(ctx0, cur, message, loop.ctrl_down[ctrl])) {
             ggml_backend_sched_set_tensor_backend(sched, gate, inkling_dense_backend);
             if (auto * out = ctrl_apply_kernel(ctx0, cur, message, gate, loop.ctrl_gain[ctrl], loop.ctrl_forget[ctrl])) {
@@ -525,7 +533,19 @@ ggml_tensor * llama_model_inkling2::graph::build_layer(int il, int ip, ggml_tens
             message(LOOP_CTRL_Q + 1),
             message(LOOP_CTRL_Q + 2),
         };
-        if (inkling_dense_backend && ctrl_down_kernel && ctrl_apply_kernel && n_tokens <= 8 && (!loras || loras->empty())) {
+        auto has_qkv_ctrl_lora = [&]() -> bool {
+            if (!loras) { return false; }
+            for (int j = 0; j < 3; ++j) {
+                for (ggml_tensor * w : {loop->ctrl_down[LOOP_CTRL_Q + j], loop->ctrl_gain[LOOP_CTRL_Q + j], loop->ctrl_forget[LOOP_CTRL_Q + j]}) {
+                    if (!w) { continue; }
+                    for (const auto & lora : *loras) {
+                        if (lora.second != 0.0f && lora.first->get_weight(w) != nullptr) { return true; }
+                    }
+                }
+            }
+            return false;
+        };
+        if (inkling_dense_backend && ctrl_down_kernel && ctrl_apply_kernel && n_tokens <= 8 && !has_qkv_ctrl_lora()) {
             ggml_tensor * gates[3] = {};
             bool ok = true;
             for (int j = 0; j < 3; ++j) {

@@ -476,10 +476,18 @@ llama_model_dflash::graph_inkling2::graph_inkling2(const llm_graph_params & para
     // vocab shortlist + Q8_0 markov_w2, fuses w2*latent + w2_b + base + softcap + first-max argmax
     // into a single Metal op, and exposes exact int32 token IDs via res->t_draft_ids.
     const int64_t head_rows = prefix_rows ? prefix_rows : block;
+    auto has_lora = [&](ggml_tensor * w) -> bool {
+        if (!loras || !w) { return false; }
+        for (const auto & lora : *loras) {
+            if (lora.second != 0.0f && lora.first->get_weight(w) != nullptr) { return true; }
+        }
+        return false;
+    };
     if (cparams.dspark_fast_argmax && cparams.n_seq_max == 1 && nb == 1 &&
             block <= hparams.dflash_block_size && head_rows > 1 && head_rows <= block &&
             rank > 0 && rank <= 512 && (rank % 32) == 0 &&
-            model.dspark_markov_w2 && model.dspark_markov_w2_b && (!loras || loras->empty()) &&
+            model.dspark_markov_w2 && model.dspark_markov_w2_b &&
+            !has_lora(model.dspark_markov_w2) && !has_lora(target->output) &&
             !target->output_s && model.dev_output() &&
             std::strcmp(ggml_backend_dev_name(model.dev_output()), "MTL0") == 0) {
         const char * fast_env = std::getenv("LLAMA_INKLING_DSPARK_FAST");
