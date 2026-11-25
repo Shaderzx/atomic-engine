@@ -1285,6 +1285,8 @@ typedef struct {
     float    clamp;
     float    bias;
     float    scale;
+    int32_t  prune_min_k;
+    float    prune_top_p;
 } ggml_metal_kargs_topk_moe;
 
 typedef struct {

@@ -349,7 +349,7 @@ static size_t ggml_backend_metal_buffer_type_get_alloc_size(ggml_backend_buffer_
                 } else if (tag == GGML_METAL_INKLING_MOE_FFN && tensor->src[2]) {
                     const size_t n_ff = (size_t)(tensor->src[2]->ne[1] / 2);
                     res = GGML_PAD(res, 64) +
-                        n_ff * 8u * (size_t)tensor->ne[2] * sizeof(float);
+                        n_ff * (size_t)tensor->ne[1] * (size_t)tensor->ne[2] * sizeof(float);
                 }
             } break;
         default:
@@ -1401,10 +1401,17 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v2(ggml_context * ctx
         ggml_tensor * q, ggml_tensor * k, ggml_tensor * v,
         ggml_tensor * table, ggml_tensor * sinks, ggml_tensor * q_pos, ggml_tensor * k_pos,
         ggml_tensor * gate, float scale, int32_t extent, int32_t n_swa) {
+    auto kv_pair_ok = [](ggml_type tk, ggml_type tv) {
+        const bool k_ok = tk == GGML_TYPE_F16 || tk == GGML_TYPE_Q8_0 || tk == GGML_TYPE_Q4_0;
+        const bool v_ok = tv == GGML_TYPE_F16 || tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0;
+        return k_ok && v_ok && (tk == tv ||
+                (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0) ||
+                (tk == GGML_TYPE_F16  && (tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0)));
+    };
     if (!q || !k || !v || !table || !sinks || !q_pos || !k_pos ||
             extent <= 0 || n_swa < 0 || q->ne[2] <= 0 || k->ne[2] <= 0 ||
             q->type != GGML_TYPE_F32 || q->ne[0] != 128 || q->ne[1] != 24 || q->ne[3] != 1 || !ggml_is_contiguous(q) ||
-            (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q8_0 && k->type != GGML_TYPE_Q4_0) || v->type != k->type ||
+            !kv_pair_ok(k->type, v->type) ||
             k->ne[0] != 128 || k->ne[1] != 8 || k->ne[3] != 1 || (k->ne[2] % 64) != 0 || !ggml_are_same_shape(k, v) ||
             !ggml_is_contiguous_1(k) || !ggml_is_contiguous_1(v) ||
             table->type != GGML_TYPE_F32 || table->ne[0] != extent || table->ne[1] != 24 || table->ne[2] != q->ne[2] || table->ne[3] != 1 || !ggml_is_contiguous(table) ||
@@ -1418,8 +1425,7 @@ static ggml_tensor * ggml_backend_metal_inkling_flash_attn_v2(ggml_context * ctx
             gate->ne[2] != 1 || gate->ne[3] != 1)) {
         return nullptr;
     }
-    const size_t expected_nb1 = ggml_row_size(k->type, 128);
-    if (k->nb[1] != expected_nb1 || v->nb[1] != expected_nb1) {
+    if (k->nb[1] != ggml_row_size(k->type, 128) || v->nb[1] != ggml_row_size(v->type, 128)) {
         return nullptr;
     }
     ggml_tensor * args[] = {q, k, v, table, sinks, q_pos, k_pos, gate};
@@ -1449,11 +1455,11 @@ static ggml_tensor * ggml_backend_metal_inkling_moe_ffn_v1(ggml_context * ctx,
             !ggml_is_contiguous(cur) || !ggml_is_contiguous(gate_up) || !ggml_is_contiguous(down) ||
             !ggml_is_matrix(ids) || ids->nb[0] != sizeof(int32_t) || (ids->nb[1] % sizeof(int32_t)) != 0 ||
             cur->ne[1] != 1 || cur->ne[3] != 1 ||
-            ids->ne[0] != 8 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
+            ids->ne[0] < 1 || ids->ne[0] > 16 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
             cur->ne[2] != ids->ne[1] ||
             gate_up->ne[0] != cur->ne[0] || (gate_up->ne[0] % 256) != 0 ||
             (gate_up->ne[1] % 8) != 0 || gate_up->ne[1] <= 0 ||
-            gate_up->ne[2] < 8 || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
+            gate_up->ne[2] < ids->ne[0] || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
             down->ne[0] != gate_up->ne[1] / 2 || (down->ne[0] % 64) != 0 ||
             down->ne[1] != cur->ne[0] || (down->ne[1] % 4) != 0 ||
             down->ne[2] != gate_up->ne[2] || down->ne[3] != 1) {
@@ -1468,7 +1474,7 @@ static ggml_tensor * ggml_backend_metal_inkling_moe_ffn_v1(ggml_context * ctx,
                        down->type == GGML_TYPE_IQ4_NL;
     if (!gu_ok || !dn_ok) { return nullptr; }
     ggml_tensor * args[] = { cur, ids, gate_up, down };
-    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], 8, ids->ne[1], 1, args, 4,
+    auto * node = ggml_custom_4d(ctx, GGML_TYPE_F32, cur->ne[0], ids->ne[0], ids->ne[1], 1, args, 4,
             +[](ggml_tensor *, int, int, void *) { GGML_ABORT("Inkling fused MoE FFN requires Metal"); }, 1, nullptr);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3, beta);
     ggml_set_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2, linear_beta);

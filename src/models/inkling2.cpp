@@ -380,8 +380,6 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
                 cparams.causal_attn && cparams.flash_attn && head_dims_match &&
                 attn_ctx && device && std::strcmp(ggml_backend_dev_name(device), "MTL0") == 0 &&
                 model.devices.size() == 1 && model.n_gpu_layers() > hparams.n_layer_all &&
-                attn_ctx->get_base()->get_type_k() == attn_ctx->get_base()->get_type_v() &&
-                attn_ctx->get_swa()->get_type_k()  == attn_ctx->get_swa()->get_type_v() &&
                 attn_ctx->get_base()->get_n_kv() > 0 && attn_ctx->get_base()->get_n_kv() % 64 == 0 &&
                 attn_ctx->get_swa()->get_n_kv()  > 0 && attn_ctx->get_swa()->get_n_kv()  % 64 == 0) {
             const auto reg = ggml_backend_dev_backend_reg(device);
@@ -395,8 +393,18 @@ ggml_tensor * llama_model_inkling2::graph::build_inputs() {
                 for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
                     auto backend = ggml_backend_sched_get_backend(sched, i);
                     if (ggml_backend_get_device(backend) != device) { continue; }
-                    if (ready(backend, n_tokens, attn_ctx->get_base()->get_type_k()) &&
-                            ready(backend, n_tokens, attn_ctx->get_swa()->get_type_k())) {
+                    const ggml_type bk = attn_ctx->get_base()->get_type_k();
+                    const ggml_type bv = attn_ctx->get_base()->get_type_v();
+                    const ggml_type sk = attn_ctx->get_swa()->get_type_k();
+                    const ggml_type sv = attn_ctx->get_swa()->get_type_v();
+                    auto pair_ok = [](ggml_type tk, ggml_type tv) {
+                        return tk == tv ||
+                               (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0) ||
+                               (tk == GGML_TYPE_F16  && (tv == GGML_TYPE_Q8_0 || tv == GGML_TYPE_Q4_0));
+                    };
+                    if (pair_ok(bk, bv) && pair_ok(sk, sv) &&
+                            ready(backend, n_tokens, bk) && ready(backend, n_tokens, bv) &&
+                            ready(backend, n_tokens, sk) && ready(backend, n_tokens, sv)) {
                         flash_backend      = backend;
                         flash_create       = create;
                         flash_create_gated = create_gated;

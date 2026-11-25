@@ -181,7 +181,8 @@ int main(int argc, char ** argv) {
 
         struct fa_case {
             const char * label;
-            ggml_type kv_type;
+            ggml_type k_type;
+            ggml_type v_type;
             int64_t n_q;
             int64_t n_kv;
             int32_t extent;
@@ -190,25 +191,30 @@ int main(int argc, char ** argv) {
             bool include_all_masked;
         };
         const std::vector<fa_case> cases = {
-            // Decode (n_q < 16), nwg=1 (n_kv=64), split-K nwg=4 (640), nwg=16 (4160), and nwg=32 (33024)
-            {"dec_q1_f16_nwg1",     GGML_TYPE_F16,  1,    64,  32,    0, 1, false},
-            {"dec_q3_f16_split4",   GGML_TYPE_F16,  3,   640,  64,    0, 1, false},
-            {"dec_q4_q8_split4",    GGML_TYPE_Q8_0, 4,   640,  64,  256, 1, false},
-            {"dec_q3_q4_split16",   GGML_TYPE_Q4_0, 3,  4160,  64,    0, 1, false},
-            {"dec_q1_f16_split32",  GGML_TYPE_F16,  1, 33024,  64,    0, 1, false},
-            {"dec_q3_q4_split32",   GGML_TYPE_Q4_0, 3, 33024,  64,    0, 2, true },
-            {"dec_q15_f16_multiseq",GGML_TYPE_F16, 15,   640,  64,    0, 4, true },
-            // Prefill (n_q >= 16, partial tiles n_q=17, 48), all-far tiles + SWA + multi-seq
-            {"pre_q17_f16_global",  GGML_TYPE_F16, 17,   640,  64,    0, 1, false},
-            {"pre_q48_f16_multiseq",GGML_TYPE_F16, 48,   640,  64,    0, 3, true },
-            {"pre_q17_q8_swa",      GGML_TYPE_Q8_0,17,   640,  64,  128, 2, false},
-            {"pre_q17_q4_global",   GGML_TYPE_Q4_0,17,   640,  64,    0, 2, false},
+            // Decode (n_q < 16), BQ in {1,2,3,4}, nwg=1 (64), 4 (640), 16 (4160), 32 (33024), 64 (65600), and mixed K/V
+            {"dec_q1_f16_nwg1",     GGML_TYPE_F16,  GGML_TYPE_F16,   1,    64,  32,    0, 1, false},
+            {"dec_q2_f16_split4",   GGML_TYPE_F16,  GGML_TYPE_F16,   2,   640,  64,    0, 1, false},
+            {"dec_q3_f16_split4",   GGML_TYPE_F16,  GGML_TYPE_F16,   3,   640,  64,    0, 1, false},
+            {"dec_q4_q8_split4",    GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,  4,   640,  64,  256, 1, false},
+            {"dec_q3_q8q4_split16", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,  3,  4160,  64,    0, 1, false},
+            {"dec_q3_q4_split16",   GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,  3,  4160,  64,    0, 1, false},
+            {"dec_q1_f16_split32",  GGML_TYPE_F16,  GGML_TYPE_F16,   1, 33024,  64,    0, 1, false},
+            {"dec_q3_q8q4_split64", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,  3, 65600,  64,    0, 1, false},
+            {"dec_q3_q4_split32",   GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,  3, 33024,  64,    0, 2, true },
+            {"dec_q15_f16_multiseq",GGML_TYPE_F16,  GGML_TYPE_F16,  15,   640,  64,    0, 4, true },
+            // Prefill (n_q >= 16, partial tiles n_q=17, 48), all-far tiles + SWA + multi-seq + mixed K/V
+            {"pre_q17_f16_global",  GGML_TYPE_F16,  GGML_TYPE_F16,  17,   640,  64,    0, 1, false},
+            {"pre_q48_f16_multiseq",GGML_TYPE_F16,  GGML_TYPE_F16,  48,   640,  64,    0, 3, true },
+            {"pre_q17_q8_swa",      GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, 17,   640,  64,  128, 2, false},
+            {"pre_q17_q8q4_global", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0, 17,   640,  64,    0, 2, false},
+            {"pre_q17_f16q4_global",GGML_TYPE_F16,  GGML_TYPE_Q4_0, 17,   640,  64,    0, 1, false},
+            {"pre_q17_q4_global",   GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 17,   640,  64,    0, 2, false},
         };
 
         const float scale = 1.0f / std::sqrt(128.0f);
         uint32_t seed = 100;
         for (const auto & tc : cases) {
-            if (!ready(backend, tc.n_q, tc.kv_type)) {
+            if (!ready(backend, tc.n_q, tc.k_type) || !ready(backend, tc.n_q, tc.v_type)) {
                 continue;
             }
             ++seed;
@@ -220,8 +226,8 @@ int main(int argc, char ** argv) {
 
             std::vector<uint8_t> k_bytes, v_bytes;
             std::vector<float> k_ref, v_ref;
-            quantize_and_dequant(tc.kv_type, k_raw, tc.n_kv * 8, 128, k_bytes, k_ref);
-            quantize_and_dequant(tc.kv_type, v_raw, tc.n_kv * 8, 128, v_bytes, v_ref);
+            quantize_and_dequant(tc.k_type, k_raw, tc.n_kv * 8, 128, k_bytes, k_ref);
+            quantize_and_dequant(tc.v_type, v_raw, tc.n_kv * 8, 128, v_bytes, v_ref);
 
             // Populate multi-sequence KV cells: interleaved seqs + shared prefix + empty holes
             std::vector<int32_t> k_pos((size_t) tc.n_kv * 3u, 0);
@@ -264,8 +270,8 @@ int main(int argc, char ** argv) {
 
             ggml_context_ptr ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
             auto * t_q     = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, tc.n_q);
-            auto * t_k     = ggml_new_tensor_3d(ctx.get(), tc.kv_type, 128, 8, tc.n_kv);
-            auto * t_v     = ggml_new_tensor_3d(ctx.get(), tc.kv_type, 128, 8, tc.n_kv);
+            auto * t_k     = ggml_new_tensor_3d(ctx.get(), tc.k_type, 128, 8, tc.n_kv);
+            auto * t_v     = ggml_new_tensor_3d(ctx.get(), tc.v_type, 128, 8, tc.n_kv);
             auto * t_tbl   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, tc.extent, 24, tc.n_q);
             auto * t_sinks = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, tc.n_q);
             auto * t_qpos  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, tc.n_q);
@@ -1002,7 +1008,7 @@ int main(int argc, char ** argv) {
         }
     });
 
-    t.test("inkling_moe_ffn_v1 coalesced parity across Q4_0/Q4_K/IQ2_XXS + Q4_0/Q5_0/Q2_0/IQ4_NL (M=1 & M=6)", [&](testing & t) {
+    t.test("inkling_moe_ffn_v1 coalesced parity across Q4_0/Q4_K/IQ2_XXS + Q4_0/Q5_0/Q2_0/IQ4_NL (top-6 & top-8, M=1 & M=6)", [&](testing & t) {
         auto create = reinterpret_cast<moe_ffn_fn>(
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_moe_ffn_v1"));
         t.assert_true(create != nullptr);
@@ -1024,78 +1030,76 @@ int main(int argc, char ** argv) {
             quantize_and_dequant(gu_type, gu_raw, (2 * n_ff) * n_exp, n_embd, gu_bytes, gu_ref);
             quantize_and_dequant(dn_type, dn_raw, n_embd * n_exp, n_ff, dn_bytes, dn_ref);
 
-            for (int64_t n_tok : {1, 6}) {
-                auto x_v = rand_vec(n_embd * n_tok, 910 + (uint32_t)n_tok, -1.0f, 1.0f);
-                // Construct realistic routes with heavy duplicate experts across tokens (e.g. expert 0 hit 6 times, expert 3 hit 4 times, etc.)
-                std::vector<int32_t> ids_v(8 * n_tok);
-                for (int64_t tok = 0; tok < n_tok; ++tok) {
-                    ids_v[tok * 8 + 0] = 0;
-                    ids_v[tok * 8 + 1] = 3;
-                    ids_v[tok * 8 + 2] = (int32_t)((tok % 3) + 1);
-                    ids_v[tok * 8 + 3] = (int32_t)((tok + 4) % n_exp);
-                    ids_v[tok * 8 + 4] = (int32_t)((tok * 2 + 5) % n_exp);
-                    ids_v[tok * 8 + 5] = (int32_t)((tok + 8) % n_exp);
-                    ids_v[tok * 8 + 6] = (int32_t)((tok % 2) + 12);
-                    ids_v[tok * 8 + 7] = 15;
-                    // Ensure 8 distinct experts per token (top-8 invariant)
-                    std::vector<bool> used(n_exp, false);
-                    for (int k = 0; k < 8; ++k) {
-                        int32_t e = ids_v[tok * 8 + k];
-                        while (used[e]) { e = (e + 1) % (int32_t)n_exp; }
-                        used[e] = true;
-                        ids_v[tok * 8 + k] = e;
-                    }
-                }
-
-                ggml_context_ptr ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
-                auto * tx   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, n_tok);
-                auto * tids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 8, n_tok);
-                auto * tgu  = ggml_new_tensor_3d(ctx.get(), gu_type, n_embd, 2 * n_ff, n_exp);
-                auto * tdn  = ggml_new_tensor_3d(ctx.get(), dn_type, n_ff, n_embd, n_exp);
-                auto * out  = create(ctx.get(), tx, tids, tgu, tdn, beta, linear_beta);
-                t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
-
-                std::vector<float> got(n_embd * 8 * n_tok);
-                run_graph(ctx.get(), out, {
-                    {tx,   {x_v.data(),      x_v.size() * sizeof(float)}},
-                    {tids, {ids_v.data(),    ids_v.size() * sizeof(int32_t)}},
-                    {tgu,  {gu_bytes.data(), gu_bytes.size()}},
-                    {tdn,  {dn_bytes.data(), dn_bytes.size()}},
-                }, got.data(), got.size() * sizeof(float));
-
-                // Pure CPU F32 reference
-                std::vector<float> ref(n_embd * 8 * n_tok, 0.0f);
-                std::vector<float> h(n_ff);
-                for (int64_t tok = 0; tok < n_tok; ++tok) {
-                    const float * xp = x_v.data() + tok * n_embd;
-                    for (int64_t k = 0; k < 8; ++k) {
-                        const int64_t e = ids_v[tok * 8 + k];
-                        const float * gup = gu_ref.data() + e * (2 * n_ff) * n_embd;
-                        for (int64_t r = 0; r < n_ff; ++r) {
-                            double g = 0.0, u = 0.0;
-                            const float * wg = gup + r * n_embd;
-                            const float * wu = gup + (r + n_ff) * n_embd;
-                            for (int64_t i = 0; i < n_embd; ++i) {
-                                g += (double)wg[i] * (double)xp[i];
-                                u += (double)wu[i] * (double)xp[i];
+            for (int64_t top_k : {6, 8}) {
+                for (int64_t n_tok : {1, 6}) {
+                    for (bool with_skipped : {false, true}) {
+                    auto x_v = rand_vec(n_embd * n_tok, 910 + (uint32_t)(n_tok * 10 + top_k + (with_skipped ? 100 : 0)), -1.0f, 1.0f);
+                    std::vector<int32_t> ids_v((size_t)(top_k * n_tok));
+                    for (int64_t tok = 0; tok < n_tok; ++tok) {
+                        std::vector<bool> used(n_exp, false);
+                        for (int64_t k = 0; k < top_k; ++k) {
+                            if (with_skipped && ((tok == 0 && k >= top_k - 2) || ((tok & 1) == 1 && k == top_k - 1))) {
+                                ids_v[(size_t)(tok * top_k + k)] = -1;
+                                continue;
                             }
-                            const float gf = (float)g, uf = (float)u;
-                            const float act = (beta * std::tanh(gf / beta)) * (1.0f / (1.0f + std::exp(-gf))) *
-                                    (linear_beta * std::tanh(uf / linear_beta));
-                            h[r] = act;
-                        }
-                        const float * dnp = dn_ref.data() + e * n_embd * n_ff;
-                        float * dp = ref.data() + (tok * 8 + k) * n_embd;
-                        for (int64_t r = 0; r < n_embd; ++r) {
-                            double acc = 0.0;
-                            const float * wd = dnp + r * n_ff;
-                            for (int64_t i = 0; i < n_ff; ++i) { acc += (double)wd[i] * (double)h[i]; }
-                            dp[r] = (float)acc;
+                            int32_t e = (int32_t)((tok * 3 + k * 2 + (k == 0 ? 0 : 1)) % n_exp);
+                            while (used[e]) { e = (e + 1) % (int32_t)n_exp; }
+                            used[e] = true;
+                            ids_v[(size_t)(tok * top_k + k)] = e;
                         }
                     }
+
+                    ggml_context_ptr ctx(ggml_init({4 * 1024 * 1024, nullptr, true}));
+                    auto * tx   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, n_embd, 1, n_tok);
+                    auto * tids = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, top_k, n_tok);
+                    auto * tgu  = ggml_new_tensor_3d(ctx.get(), gu_type, n_embd, 2 * n_ff, n_exp);
+                    auto * tdn  = ggml_new_tensor_3d(ctx.get(), dn_type, n_ff, n_embd, n_exp);
+                    auto * out  = create(ctx.get(), tx, tids, tgu, tdn, beta, linear_beta);
+                    t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+                    std::vector<float> got((size_t)(n_embd * top_k * n_tok), -999.0f);
+                    run_graph(ctx.get(), out, {
+                        {tx,   {x_v.data(),      x_v.size() * sizeof(float)}},
+                        {tids, {ids_v.data(),    ids_v.size() * sizeof(int32_t)}},
+                        {tgu,  {gu_bytes.data(), gu_bytes.size()}},
+                        {tdn,  {dn_bytes.data(), dn_bytes.size()}},
+                    }, got.data(), got.size() * sizeof(float));
+
+                    std::vector<float> ref((size_t)(n_embd * top_k * n_tok), 0.0f);
+                    std::vector<float> h(n_ff);
+                    for (int64_t tok = 0; tok < n_tok; ++tok) {
+                        const float * xp = x_v.data() + tok * n_embd;
+                        for (int64_t k = 0; k < top_k; ++k) {
+                            const int64_t e = ids_v[(size_t)(tok * top_k + k)];
+                            if (e < 0) { continue; }
+                            const float * gup = gu_ref.data() + e * (2 * n_ff) * n_embd;
+                            for (int64_t r = 0; r < n_ff; ++r) {
+                                double g = 0.0, u = 0.0;
+                                const float * wg = gup + r * n_embd;
+                                const float * wu = gup + (r + n_ff) * n_embd;
+                                for (int64_t i = 0; i < n_embd; ++i) {
+                                    g += (double)wg[i] * (double)xp[i];
+                                    u += (double)wu[i] * (double)xp[i];
+                                }
+                                const float gf = (float)g, uf = (float)u;
+                                const float act = (beta * std::tanh(gf / beta)) * (1.0f / (1.0f + std::exp(-gf))) *
+                                        (linear_beta * std::tanh(uf / linear_beta));
+                                h[r] = act;
+                            }
+                            const float * dnp = dn_ref.data() + e * n_embd * n_ff;
+                            float * dp = ref.data() + (tok * top_k + k) * n_embd;
+                            for (int64_t r = 0; r < n_embd; ++r) {
+                                double acc = 0.0;
+                                const float * wd = dnp + r * n_ff;
+                                for (int64_t i = 0; i < n_ff; ++i) { acc += (double)wd[i] * (double)h[i]; }
+                                dp[r] = (float)acc;
+                            }
+                        }
+                    }
+                    const float diff = max_abs_diff(got, ref);
+                    t.assert_true(diff < 5e-4f);
+                    }
                 }
-                const float diff = max_abs_diff(got, ref);
-                t.assert_true(diff < 5e-4f);
             }
         }
     });

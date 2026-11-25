@@ -3560,6 +3560,8 @@ struct inkling_moe_gu_args {
     uint32_t n_ff;       // half of gate_up ne01
     uint32_t n_tokens;
     uint32_t ids_stride; // in int32 elements
+    uint32_t n_exp_used;
+    uint32_t _pad0;
     uint64_t nb01;
     uint64_t nb02;
     uint64_t nb12;       // token stride of input cur [n_embd, 1, n_tokens] in bytes
@@ -3574,6 +3576,8 @@ struct inkling_moe_down_args {
     uint32_t n_embd;
     uint32_t n_tokens;
     uint32_t ids_stride;
+    uint32_t n_exp_used;
+    uint32_t _pad0;
     uint64_t nb01;
     uint64_t nb02;
 };
@@ -3593,13 +3597,15 @@ inline float inkling_apply_situ(float g, float u, constant inkling_moe_gu_args &
 inline bool inkling_load_slot(
         uint32_t n_tokens,
         uint32_t ids_stride,
+        uint32_t n_exp_used,
         uint32_t gy,
         device const int32_t * ids,
         thread uint32_t      & expert_id,
         thread uint32_t      & tok) {
-    if (gy >= n_tokens * 8u) { return false; }
-    tok = gy >> 3;
-    const int32_t e = ids[tok * ids_stride + (gy & 7u)];
+    if (gy >= n_tokens * n_exp_used) { return false; }
+    tok = gy / n_exp_used;
+    const uint32_t slot = gy - tok * n_exp_used;
+    const int32_t e = ids[tok * ids_stride + slot];
     if (e < 0) { return false; }
     expert_id = uint32_t(e);
     return true;
@@ -3616,7 +3622,7 @@ kernel void kernel_inkling_moe_gate_up_situ_q4_0(
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t first_row = (tgpig.x * 2u + sg) * 2u;
     if (first_row >= args.n_ff) { return; }
 
@@ -3666,7 +3672,7 @@ kernel void kernel_inkling_moe_gate_up_situ_q4_K(
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t row = tgpig.x * 4u + sg;
     if (row >= args.n_ff) { return; }
 
@@ -3780,7 +3786,7 @@ kernel void kernel_inkling_moe_gate_up_situ_iq2_xxs(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t first_row = (tgpig.x * 4u + sg) * 2u;
     if (first_row >= args.n_ff) { return; }
 
@@ -3840,10 +3846,18 @@ kernel void kernel_inkling_moe_down_q45(
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
-    uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) {
+        if (tgpig.y < args.n_tokens * args.n_exp_used && lane == 0u) {
+            device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+            FOR_UNROLL (short r = 0; r < 4; ++r) {
+                if (first_row + r < args.n_embd) { drow[first_row + r] = 0.0f; }
+            }
+        }
+        return;
+    }
 
     const int nb = int(args.n_ff / QK4_0);
     const short ix = lane / 2;
@@ -3890,10 +3904,18 @@ kernel void kernel_inkling_moe_down_q2_0(
         uint2  tgpig [[threadgroup_position_in_grid]],
         ushort lane  [[thread_index_in_simdgroup]],
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
-    uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) {
+        if (tgpig.y < args.n_tokens * args.n_exp_used && lane == 0u) {
+            device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+            FOR_UNROLL (short r = 0; r < 4; ++r) {
+                if (first_row + r < args.n_embd) { drow[first_row + r] = 0.0f; }
+            }
+        }
+        return;
+    }
 
     const int nb = int(args.n_ff / QK2_0);
     const short ix = lane / 4;
@@ -3934,10 +3956,18 @@ kernel void kernel_inkling_moe_down_iq4_nl(
     if (sg == 0u && lane < 16u) { lut[lane] = kvalues_iq4nl_f[lane]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    uint32_t expert_id, tok;
-    if (!inkling_load_slot(args.n_tokens, args.ids_stride, tgpig.y, ids, expert_id, tok)) { return; }
     const uint32_t first_row = (tgpig.x * 2u + sg) * 4u;
     if (first_row >= args.n_embd) { return; }
+    uint32_t expert_id, tok;
+    if (!inkling_load_slot(args.n_tokens, args.ids_stride, args.n_exp_used, tgpig.y, ids, expert_id, tok)) {
+        if (tgpig.y < args.n_tokens * args.n_exp_used && lane == 0u) {
+            device float * drow = dst + (uint64_t)tgpig.y * args.n_embd;
+            FOR_UNROLL (short r = 0; r < 4; ++r) {
+                if (first_row + r < args.n_embd) { drow[first_row + r] = 0.0f; }
+            }
+        }
+        return;
+    }
 
     const int nb = int(args.n_ff / QK4_NL);
     const short ix = lane / 2;

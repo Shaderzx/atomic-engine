@@ -83,7 +83,10 @@ kernel void kernel_inkling_conv_fused(
             float sum_e = 0.0f;
             const uint64_t e_base = (uint64_t)tok * ne;
             for (uint e = 0; e < ne; ++e) {
-                sum_e += cur[(e_base + e) * args.channels + ch] * exp_weights[e_base + e];
+                const float ew = exp_weights[e_base + e];
+                if (ew != 0.0f) {
+                    sum_e += cur[(e_base + e) * args.channels + ch] * ew;
+                }
             }
             x_t = sum_e;
         } else {

@@ -732,7 +732,7 @@ inline float4 inkling_load_kv4(device const char * base, uint row, uint kv_head,
     }
 }
 
-template <int BQ, int KV_KIND>
+template <int BQ, int K_KIND, int V_KIND>
 kernel void kernel_inkling_fa_decode_impl(
         constant inkling_fa_decode_args & args [[buffer(0)]],
         device const float * q       [[buffer(1)]],
@@ -750,6 +750,7 @@ kernel void kernel_inkling_fa_decode_impl(
         ushort sg    [[simdgroup_index_in_threadgroup]]) {
     constexpr int NSG = 4;
     constexpr int SLOTS = BQ * 3;
+    constexpr float LOG2E = 1.4426950408889634f;
 
     const uint q0 = tgpig.x * BQ;
     const uint kv_head = tgpig.y;
@@ -757,13 +758,13 @@ kernel void kernel_inkling_fa_decode_impl(
     const uint nwg = args.nwg;
     const uint extent = args.extent;
     const int  n_swa = (int)args.n_swa;
+    const float q_scale = args.scale * LOG2E;
 
     half4  q_reg[SLOTS];
     float4 o_reg[SLOTS];
     float  M[SLOTS];
     float  S[SLOTS];
     float  sink_r[SLOTS];
-    float  far_r[SLOTS];
     int    qpos_r[BQ];
     ulong  qbit_r[BQ];
     int    min_qp = INT_MAX;
@@ -786,10 +787,8 @@ kernel void kernel_inkling_fa_decode_impl(
                 const uint head = kv_head * 3u + (uint)g;
                 const uint qh = q_idx * 24u + head;
                 const float4 qv = ((device const float4 *)(q + (uint64_t)qh * 128u))[lane];
-                q_reg[slot] = half4(qv * args.scale);
-                const float sk = sinks[qh];
-                sink_r[slot] = sk;
-                far_r[slot] = -sk;
+                q_reg[slot] = half4(qv * q_scale);
+                sink_r[slot] = sinks[qh] * LOG2E;
                 o_reg[slot] = 0.0f;
                 M[slot] = -FLT_MAX / 2.0f;
                 S[slot] = 0.0f;
@@ -801,7 +800,6 @@ kernel void kernel_inkling_fa_decode_impl(
                 const int slot = qi * 3 + g;
                 q_reg[slot] = 0.0h;
                 sink_r[slot] = 0.0f;
-                far_r[slot] = 0.0f;
                 o_reg[slot] = 0.0f;
                 M[slot] = -FLT_MAX / 2.0f;
                 S[slot] = 0.0f;
@@ -809,16 +807,19 @@ kernel void kernel_inkling_fa_decode_impl(
         }
     }
 
-    const uint step = nwg * (uint)NSG;
-    for (uint ik = iwg * (uint)NSG + sg; ik < args.n_kv; ik += step) {
+    // Contiguous split-K chunk per threadgroup for sequential memory prefetching & L1 k_pos locality
+    const uint chunk = (args.n_kv + nwg - 1u) / nwg;
+    const uint k_beg = iwg * chunk;
+    const uint k_end = min(args.n_kv, k_beg + chunk);
+    for (uint ik = k_beg + sg; ik < k_end; ik += (uint)NSG) {
         const uint kbase = ik * 3u;
         const int kp = k_pos[kbase];
         const ulong kmask = ulong(uint(k_pos[kbase + 1u])) | (ulong(uint(k_pos[kbase + 2u])) << 32);
         if (kp < 0 || (kmask & tg_seq_mask) == 0ULL || kp > max_qp || (n_swa > 0 && kp <= min_qp - n_swa)) {
             continue;
         }
-        const float4 k4 = inkling_load_kv4<KV_KIND>(k, ik, kv_head, args.nb11, args.nb12, lane);
-        const float4 v4 = inkling_load_kv4<KV_KIND>(v, ik, kv_head, args.nb21, args.nb22, lane);
+        const float4 k4 = inkling_load_kv4<K_KIND>(k, ik, kv_head, args.nb11, args.nb12, lane);
+        const float4 v4 = inkling_load_kv4<V_KIND>(v, ik, kv_head, args.nb21, args.nb22, lane);
 
         FOR_UNROLL (int qi = 0; qi < BQ; ++qi) {
             const uint q_idx = q0 + qi;
@@ -829,20 +830,21 @@ kernel void kernel_inkling_fa_decode_impl(
             FOR_UNROLL (int g = 0; g < 3; ++g) {
                 const int slot = qi * 3 + g;
                 const float qk = simd_sum(dot(float4(q_reg[slot]), k4));
-                float bias;
-                if (is_far) {
-                    bias = far_r[slot];
-                } else {
+                float s = qk - sink_r[slot];
+                if (!is_far) {
                     const uint qh = q_idx * 24u + kv_head * 3u + (uint)g;
-                    bias = table[(uint64_t)qh * extent + (uint)d] - sink_r[slot];
+                    s += table[(uint64_t)qh * extent + (uint)d] * LOG2E;
                 }
-                const float s = qk + bias;
-                const float m_new = max(M[slot], s);
-                const float ms = exp(M[slot] - m_new);
-                const float p = exp(s - m_new);
-                S[slot] = S[slot] * ms + p;
-                M[slot] = m_new;
-                o_reg[slot] = o_reg[slot] * ms + p * v4;
+                if (s > M[slot]) {
+                    const float ms = exp2(M[slot] - s);
+                    S[slot] = S[slot] * ms + 1.0f;
+                    o_reg[slot] = o_reg[slot] * ms + v4;
+                    M[slot] = s;
+                } else {
+                    const float p = exp2(s - M[slot]);
+                    S[slot] += p;
+                    o_reg[slot] = fma(p, v4, o_reg[slot]);
+                }
             }
         }
     }
@@ -879,15 +881,15 @@ kernel void kernel_inkling_fa_decode_impl(
                 float4 o_all = 0.0f;
                 FOR_UNROLL (int ksg = 0; ksg < NSG; ++ksg) {
                     if (sh_s[ksg] > 0.0f) {
-                        const float w = exp(sh_m[ksg] - m_all);
+                        const float w = exp2(sh_m[ksg] - m_all);
                         s_all += sh_s[ksg] * w;
                         o_all += sh_o[ksg * 32u + lane] * w;
                     }
                 }
                 if (nwg == 1u) {
                     const float mf = max(m_all, 0.0f);
-                    const float corr = exp(m_all - mf);
-                    const float denom = s_all * corr + exp(-mf);
+                    const float corr = exp2(m_all - mf);
+                    const float denom = s_all * corr + exp2(-mf);
                     const float inv = denom == 0.0f ? 0.0f : corr / denom;
                     const uint64_t out_off4 = ((uint64_t)q_idx * 24u + head) * 32u + lane;
                     float4 out4 = o_all * inv;
@@ -937,15 +939,15 @@ kernel void kernel_inkling_fa_decode_reduce(
         const float sw = base[w * SPLIT_STRIDE + 129u];
         if (sw > 0.0f) {
             const float mw = base[w * SPLIT_STRIDE + 128u];
-            const float wt = exp(mw - m_all);
+            const float wt = exp2(mw - m_all);
             s_all += sw * wt;
             o_all += ((device const float4 *)(base + w * SPLIT_STRIDE))[lane] * wt;
         }
     }
 
     const float mf = max(m_all, 0.0f);
-    const float corr = exp(m_all - mf);
-    const float denom = s_all * corr + exp(-mf);
+    const float corr = exp2(m_all - mf);
+    const float denom = s_all * corr + exp2(-mf);
     const float inv = denom == 0.0f ? 0.0f : corr / denom;
     const uint64_t out_off4 = ((uint64_t)q_idx * 24u + head) * 32u + lane;
     float4 out4 = o_all * inv;
@@ -956,9 +958,16 @@ kernel void kernel_inkling_fa_decode_reduce(
     ((device float4 *)dst)[out_off4] = out4;
 }
 
-template [[host_name("kernel_inkling_fa_decode_f16_q1")]]  kernel void kernel_inkling_fa_decode_impl<1, 0>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
-template [[host_name("kernel_inkling_fa_decode_f16_q4")]]  kernel void kernel_inkling_fa_decode_impl<4, 0>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
-template [[host_name("kernel_inkling_fa_decode_q8_0_q1")]] kernel void kernel_inkling_fa_decode_impl<1, 1>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
-template [[host_name("kernel_inkling_fa_decode_q8_0_q4")]] kernel void kernel_inkling_fa_decode_impl<4, 1>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
-template [[host_name("kernel_inkling_fa_decode_q4_0_q1")]] kernel void kernel_inkling_fa_decode_impl<1, 2>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
-template [[host_name("kernel_inkling_fa_decode_q4_0_q4")]] kernel void kernel_inkling_fa_decode_impl<4, 2>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
+#define DECL_INKLING_FA_DECODE_SET(NAME, KK, VK) \
+template [[host_name("kernel_inkling_fa_decode_" #NAME "_q1")]] kernel void kernel_inkling_fa_decode_impl<1, KK, VK>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort); \
+template [[host_name("kernel_inkling_fa_decode_" #NAME "_q2")]] kernel void kernel_inkling_fa_decode_impl<2, KK, VK>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort); \
+template [[host_name("kernel_inkling_fa_decode_" #NAME "_q3")]] kernel void kernel_inkling_fa_decode_impl<3, KK, VK>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort); \
+template [[host_name("kernel_inkling_fa_decode_" #NAME "_q4")]] kernel void kernel_inkling_fa_decode_impl<4, KK, VK>(constant inkling_fa_decode_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, uint3, ushort, ushort);
+
+DECL_INKLING_FA_DECODE_SET(f16,       0, 0)
+DECL_INKLING_FA_DECODE_SET(q8_0,      1, 1)
+DECL_INKLING_FA_DECODE_SET(q4_0,      2, 2)
+DECL_INKLING_FA_DECODE_SET(q8_0_q4_0, 1, 2)
+DECL_INKLING_FA_DECODE_SET(f16_q8_0,  0, 1)
+DECL_INKLING_FA_DECODE_SET(f16_q4_0,  0, 2)
+#undef DECL_INKLING_FA_DECODE_SET

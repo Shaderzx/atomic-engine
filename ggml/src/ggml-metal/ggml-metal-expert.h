@@ -35,7 +35,7 @@ enum { GGML_METAL_INKLING_MOE_MAX_TOKENS = 11 };
 // Shared layout constants between host Metal allocator/encoders and kernels.
 // Split-K decode partition layout: 128 output floats + m + s + 2 pad floats = 132 floats (528 B, 16-byte aligned for float4).
 enum { GGML_METAL_INKLING_FA_SPLIT_STRIDE  = 132 };
-enum { GGML_METAL_INKLING_FA_SPLIT_MAX_NWG = 32  };
+enum { GGML_METAL_INKLING_FA_SPLIT_MAX_NWG = 64  };
 // Depth-attention mix max input states: GGML_MAX_SRC (10) - 2 = 8 states (+ 1 query = 9 < GGML_MAX_SRC).
 enum { GGML_METAL_INKLING_MIX_MAX_STATES   = 8   };
 

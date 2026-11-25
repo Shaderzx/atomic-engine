@@ -305,12 +305,21 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     const uint32_t n_swa  = (uint32_t)node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 4];
                     const uint32_t extent = (uint32_t)node->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3];
                     const float    scale  = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 2);
-                    const ggml_type kv_type = node->src[1]->type;
+                    const ggml_type k_type = node->src[1]->type;
+                    const ggml_type v_type = node->src[2]->type;
+                    auto kv_suffix = [](ggml_type tk, ggml_type tv) -> const char * {
+                        if (tk == GGML_TYPE_F16  && tv == GGML_TYPE_F16)  return "f16";
+                        if (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q8_0) return "q8_0";
+                        if (tk == GGML_TYPE_Q4_0 && tv == GGML_TYPE_Q4_0) return "q4_0";
+                        if (tk == GGML_TYPE_Q8_0 && tv == GGML_TYPE_Q4_0) return "q8_0_q4_0";
+                        if (tk == GGML_TYPE_F16  && tv == GGML_TYPE_Q8_0) return "f16_q8_0";
+                        return "f16_q4_0";
+                    };
+                    const char * kvs = kv_suffix(k_type, v_type);
 
                     if (n_q >= 16) {
-                        const char * kernel = kv_type == GGML_TYPE_F16  ? "kernel_inkling_fa_tensor_f16"
-                                            : kv_type == GGML_TYPE_Q8_0 ? "kernel_inkling_fa_tensor_q8_0"
-                                                                        : "kernel_inkling_fa_tensor_q4_0";
+                        char kernel[64];
+                        std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_tensor_%s", kvs);
                         auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
                         if (!pipeline.pipeline) {
                             pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
@@ -325,8 +334,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                             (uint32_t)node->src[2]->nb[1], (uint32_t)node->src[2]->nb[2],
                             scale,
                         };
-                        const uint32_t Q = kv_type == GGML_TYPE_F16 ? 32u : 16u;
-                        const size_t smem = ggml_metal_inkling_fa_tensor_smem(Q, kv_type != GGML_TYPE_F16);
+                        const bool both_f16 = (k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16);
+                        const uint32_t Q = both_f16 ? 32u : 16u;
+                        const size_t smem = ggml_metal_inkling_fa_tensor_smem(Q, !both_f16);
                         ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
                         ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
                         for (int i = 0; i < 7; ++i) {
@@ -336,12 +346,13 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, smem, 0);
                         ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + Q - 1) / Q, 24, 1, 32, 4, 1);
                     } else {
-                        const uint32_t bq  = n_q == 1 ? 1u : 4u;
-                        const uint32_t nwg = n_kv <= 512u ? 1u : (n_kv <= 4096u ? 4u : (n_kv <= 32768u ? 16u : GGML_METAL_INKLING_FA_SPLIT_MAX_NWG));
-                        const char * kernel = nullptr;
-                        if (kv_type == GGML_TYPE_F16)       { kernel = bq == 1 ? "kernel_inkling_fa_decode_f16_q1"  : "kernel_inkling_fa_decode_f16_q4"; }
-                        else if (kv_type == GGML_TYPE_Q8_0) { kernel = bq == 1 ? "kernel_inkling_fa_decode_q8_0_q1" : "kernel_inkling_fa_decode_q8_0_q4"; }
-                        else                                { kernel = bq == 1 ? "kernel_inkling_fa_decode_q4_0_q1" : "kernel_inkling_fa_decode_q4_0_q4"; }
+                        const uint32_t bq  = n_q <= 4u ? n_q : 4u;
+                        const uint32_t nwg = n_kv <= 512u ? 1u
+                                           : (n_kv <= 4096u ? 4u
+                                           : (n_kv <= 32768u ? 16u
+                                           : (n_kv <= 65536u ? 32u : GGML_METAL_INKLING_FA_SPLIT_MAX_NWG)));
+                        char kernel[64];
+                        std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_%s_q%u", kvs, bq);
                         auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
                         if (!pipeline.pipeline) {
                             pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
@@ -371,14 +382,14 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                         ggml_metal_encoder_set_buffer(ctx->enc, bid_gate, 10);
                         ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + bq - 1) / bq, 8, nwg, 32, 4, 1);
 
-                        if (nwg >= GGML_METAL_INKLING_FA_SPLIT_MAX_NWG) {
+                        if (nwg >= 32u) {
                             static const bool log_split32 = []() {
                                 const char * v = std::getenv("GGML_METAL_INKLING_LOG_DISPATCH");
                                 return v && std::strcmp(v, "1") == 0;
                             }();
                             if (log_split32) {
-                                std::fprintf(stderr, "inkling_fa_decode_split32: dispatched nwg=%u n_q=%u n_kv=%u type=%s\n",
-                                        nwg, n_q, n_kv, ggml_type_name(kv_type));
+                                std::fprintf(stderr, "inkling_fa_decode_split32: dispatched nwg=%u n_q=%u n_kv=%u type=%s/%s\n",
+                                        nwg, n_q, n_kv, ggml_type_name(k_type), ggml_type_name(v_type));
                                 std::fflush(stderr);
                             }
                         }
@@ -510,6 +521,7 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
 
                     const uint32_t n_embd     = (uint32_t)cur->ne[0];
                     const uint32_t n_ff       = (uint32_t)(gate_up->ne[1] / 2);
+                    const uint32_t n_exp_used = (uint32_t)ids->ne[0];
                     const uint32_t n_tokens   = (uint32_t)node->ne[2];
                     const uint32_t ids_stride = (uint32_t)(ids->nb[1] / sizeof(int32_t));
                     const float beta          = ggml_get_op_params_f32(node, GGML_MAX_OP_PARAMS / sizeof(int32_t) - 3);
@@ -539,16 +551,16 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     ggml_metal_buffer_id bid_dn   = ggml_metal_get_buffer_id(down);
 
                     // Direct per-slot dispatch (zero plan barrier, zero hot-expert tail imbalance, full NR0=4 reuse).
-                    const uint32_t n_slots = 8u * n_tokens;
+                    const uint32_t n_slots = n_exp_used * n_tokens;
 
                     {
                         auto p_gu = get_pipe(gu_name);
                         struct {
-                            uint32_t n_embd, n_ff, n_tokens, ids_stride;
+                            uint32_t n_embd, n_ff, n_tokens, ids_stride, n_exp_used, _pad0;
                             uint64_t nb01, nb02, nb12;
                             float    beta, inv_beta, linear_beta, inv_linear_beta;
                         } gu_args = {
-                            n_embd, n_ff, n_tokens, ids_stride,
+                            n_embd, n_ff, n_tokens, ids_stride, n_exp_used, 0u,
                             (uint64_t)gate_up->nb[1], (uint64_t)gate_up->nb[2], (uint64_t)cur->nb[2],
                             beta, 1.0f / beta, linear_beta, linear_beta > 0.0f ? 1.0f / linear_beta : 0.0f,
                         };
@@ -570,10 +582,10 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     {
                         auto p_dn = get_pipe(dn_name);
                         struct {
-                            uint32_t n_ff, n_embd, n_tokens, ids_stride;
+                            uint32_t n_ff, n_embd, n_tokens, ids_stride, n_exp_used, _pad0;
                             uint64_t nb01, nb02;
                         } dn_args = {
-                            n_ff, n_embd, n_tokens, ids_stride,
+                            n_ff, n_embd, n_tokens, ids_stride, n_exp_used, 0u,
                             (uint64_t)down->nb[1], (uint64_t)down->nb[2],
                         };
                         ggml_metal_encoder_set_pipeline(ctx->enc, p_dn);
@@ -6738,13 +6750,46 @@ int ggml_metal_op_topk_moe(ggml_metal_op_t ctx, int idx) {
         scale = ggml_get_op_params_f32(weights, 0);
     }
 
+    static const float moe_top_p_env = []() {
+        const char * v = std::getenv("LLAMA_INKLING_MOE_TOP_P");
+        return v ? std::strtof(v, nullptr) : 0.0f;
+    }();
+    static const int32_t moe_min_k_env = []() {
+        const char * v = std::getenv("LLAMA_INKLING_MOE_MIN_K");
+        return v ? (int32_t) std::atoi(v) : 0;
+    }();
+    bool ids_used_by_inkling_moe = false;
+    bool ids_used_by_other = false;
+    if (gating == 1 && with_norm &&
+        moe_top_p_env > 0.0f && moe_top_p_env < 1.0f &&
+        moe_min_k_env >= 1 && moe_min_k_env < (int32_t) n_expert_used &&
+        n_expert_used <= 16 && n_tokens >= 1 && n_tokens <= 7) {
+        const int scan_end = std::min(ctx->n_nodes(), idx + n_fuse + 32);
+        for (int j = idx + n_fuse; j < scan_end; ++j) {
+            const ggml_tensor * nd = ctx->node(j);
+            for (int s = 0; s < GGML_MAX_SRC && nd->src[s]; ++s) {
+                if (nd->src[s] == ids || nd->src[s]->view_src == ids) {
+                    if (nd->op == GGML_OP_CUSTOM &&
+                        nd->op_params[GGML_MAX_OP_PARAMS / sizeof(int32_t) - 1] == GGML_METAL_INKLING_MOE_FFN) {
+                        ids_used_by_inkling_moe = true;
+                    } else if (nd->op != GGML_OP_GET_ROWS) {
+                        ids_used_by_other = true;
+                    }
+                }
+            }
+        }
+    }
+    const bool do_prune = ids_used_by_inkling_moe && !ids_used_by_other;
+
     ggml_metal_kargs_topk_moe args = {
-        /*.ne01      =*/ (int32_t) n_tokens,
-        /*.nb01      =*/ logits->nb[1],
-        /*.nb1_ids   =*/ ids->nb[1],
-        /*.clamp =*/ clamp,
-        /*.bias  =*/ bias,
-        /*.scale =*/ scale,
+        /*.ne01        =*/ (int32_t) n_tokens,
+        /*.nb01        =*/ logits->nb[1],
+        /*.nb1_ids     =*/ ids->nb[1],
+        /*.clamp       =*/ clamp,
+        /*.bias        =*/ bias,
+        /*.scale       =*/ scale,
+        /*.prune_min_k =*/ do_prune ? moe_min_k_env : 0,
+        /*.prune_top_p =*/ do_prune ? moe_top_p_env : 0.0f,
     };
 
     auto pipeline = ggml_metal_library_get_pipeline_topk_moe(lib, (int32_t) n_expert, (int32_t) n_expert_used,

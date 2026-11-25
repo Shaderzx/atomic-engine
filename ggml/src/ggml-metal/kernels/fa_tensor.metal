@@ -353,7 +353,7 @@ inline void inkling_fa_stage_kv_q4_0(
     }
 }
 
-template <short Q, int KV_KIND>
+template <short Q, int K_KIND, int V_KIND>
 kernel void kernel_inkling_fa_tensor_impl(
         constant inkling_fa_tensor_args & args [[buffer(0)]],
         device const float * q       [[buffer(1)]],
@@ -478,7 +478,7 @@ kernel void kernel_inkling_fa_tensor_impl(
 
     auto tv_dev0 = tensor((device half *)v_base, dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv_f16}));
     auto tv_tg0  = tensor(skv, dextents<int32_t, 2>(DV, C));
-    using tv_ref_t = conditional_t<KV_KIND == 0, decltype(tv_dev0), decltype(tv_tg0)>;
+    using tv_ref_t = conditional_t<V_KIND == 0, decltype(tv_dev0), decltype(tv_tg0)>;
     auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), tv_ref_t, float>();
     FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
         if (co.is_valid_element(i)) {
@@ -511,10 +511,10 @@ kernel void kernel_inkling_fa_tensor_impl(
         }
         const bool all_far = ((sf[1] & 2) != 0) && ((sf[2] & 2) != 0);
 
-        if constexpr (KV_KIND == 0) {
+        if constexpr (K_KIND == 0) {
             auto tk = tensor((device half *)(k_base + (uint64_t)ic * args.nb12), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk_f16}));
             mm_qk.run(tq, tk, ts);
-        } else if constexpr (KV_KIND == 1) {
+        } else if constexpr (K_KIND == 1) {
             inkling_fa_stage_kv_q8_0(skv, k, ic, kv_head, args.nb11, args.nb12, tiitg);
             threadgroup_barrier(mem_flags::mem_threadgroup);
             auto tk = tensor(skv, dextents<int32_t, 2>(DK, C));
@@ -528,9 +528,9 @@ kernel void kernel_inkling_fa_tensor_impl(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if constexpr (KV_KIND == 1) {
+        if constexpr (V_KIND == 1) {
             inkling_fa_stage_kv_q8_0(skv, v, ic, kv_head, args.nb21, args.nb22, tiitg);
-        } else if constexpr (KV_KIND == 2) {
+        } else if constexpr (V_KIND == 2) {
             inkling_fa_stage_kv_q4_0(skv, v, ic, kv_head, args.nb21, args.nb22, tiitg);
         }
 
@@ -605,7 +605,7 @@ kernel void kernel_inkling_fa_tensor_impl(
             }
         }
 
-        if constexpr (KV_KIND == 0) {
+        if constexpr (V_KIND == 0) {
             auto tv = tensor((device half *)(v_base + (uint64_t)ic * args.nb22), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv_f16}));
             mm_pv.run(tp, tv, co);
         } else {
@@ -642,8 +642,11 @@ kernel void kernel_inkling_fa_tensor_impl(
     }
 }
 
-template [[host_name("kernel_inkling_fa_tensor_f16")]]  kernel void kernel_inkling_fa_tensor_impl<32, 0>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
-template [[host_name("kernel_inkling_fa_tensor_q8_0")]] kernel void kernel_inkling_fa_tensor_impl<16, 1>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
-template [[host_name("kernel_inkling_fa_tensor_q4_0")]] kernel void kernel_inkling_fa_tensor_impl<16, 2>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_f16")]]       kernel void kernel_inkling_fa_tensor_impl<32, 0, 0>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_q8_0")]]      kernel void kernel_inkling_fa_tensor_impl<16, 1, 1>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_q4_0")]]      kernel void kernel_inkling_fa_tensor_impl<16, 2, 2>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_q8_0_q4_0")]] kernel void kernel_inkling_fa_tensor_impl<16, 1, 2>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_f16_q8_0")]]  kernel void kernel_inkling_fa_tensor_impl<16, 0, 1>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
+template [[host_name("kernel_inkling_fa_tensor_f16_q4_0")]]  kernel void kernel_inkling_fa_tensor_impl<16, 0, 2>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
 
 #endif // GGML_METAL_HAS_TENSOR

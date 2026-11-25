@@ -1612,8 +1612,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             dev->props.max_theadgroup_memory_size < 32768) {
                         return false;
                     }
-                    const bool kv_ok = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0) &&
-                                       v->type == k->type;
+                    const bool k_ok = (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q8_0 || k->type == GGML_TYPE_Q4_0);
+                    const bool v_ok = (v->type == GGML_TYPE_F16 || v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0);
+                    const bool kv_ok = k_ok && v_ok && (v->type == k->type ||
+                            (k->type == GGML_TYPE_Q8_0 && v->type == GGML_TYPE_Q4_0) ||
+                            (k->type == GGML_TYPE_F16  && (v->type == GGML_TYPE_Q8_0 || v->type == GGML_TYPE_Q4_0)));
                     const bool gate_ok = !gate || (q->ne[2] < 16 &&
                                                    gate->type == GGML_TYPE_F32 && ggml_is_contiguous(gate) &&
                                                    gate->ne[0] == q->ne[0] * q->ne[1] && gate->ne[1] == q->ne[2] &&
@@ -1736,11 +1739,11 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
                             !ggml_is_contiguous(cur) || !ggml_is_contiguous(gate_up) || !ggml_is_contiguous(down) ||
                             !ggml_is_matrix(ids) || ids->nb[0] != sizeof(int32_t) || (ids->nb[1] % sizeof(int32_t)) != 0 ||
                             cur->ne[1] != 1 || cur->ne[3] != 1 ||
-                            ids->ne[0] != 8 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
+                            ids->ne[0] < 1 || ids->ne[0] > 16 || ids->ne[1] < 1 || ids->ne[1] > GGML_METAL_INKLING_MOE_MAX_TOKENS ||
                             cur->ne[2] != ids->ne[1] ||
                             gate_up->ne[0] != cur->ne[0] || (gate_up->ne[0] % 256) != 0 ||
                             (gate_up->ne[1] % 8) != 0 || gate_up->ne[1] <= 0 ||
-                            gate_up->ne[2] < 8 || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
+                            gate_up->ne[2] < ids->ne[0] || gate_up->ne[2] > 128 || gate_up->ne[3] != 1 ||
                             down->ne[0] != gate_up->ne[1] / 2 || (down->ne[0] % 64) != 0 ||
                             down->ne[1] != cur->ne[0] || (down->ne[1] % 4) != 0 ||
                             down->ne[2] != gate_up->ne[2] || down->ne[3] != 1) {

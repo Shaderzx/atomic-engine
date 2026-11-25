@@ -105,3 +105,25 @@ Why? Because:
 1. Unfused Inkling ops (`clip`, `conv_residual`, `control`, `situ`, `rel_mask`) + materialized `kq_b`
 2. DSpark `n_ubatch = 32` forcing 8,192 tiny CPU-copied injections at 256K
 3. Non-optimal `ubatch` / `Q4_0` KV dequantization overhead vs `F16` / `Q8_0` KV and Metal 4 `fa_tensor`!
+
+## 6. Exact 48-Visit Target Byte Model: `M5-Q4_0Pure` (`top-6` & Dynamic `top-p`, 2026-11-25)
+
+Exact tensor byte counts parsed from `Inkling-2-Mini-M5-Q4_0Pure-Uncensored.gguf` (`13.71 GiB`, KKT-optimal fixed-scale rank-1 `Q4_0` baked abliteration — `100.00%` projection retention, `2.30%` nibbles flipped, `0 B` growth, `loras->empty() == true`):
+
+| Component | 48-visit `M=1` `top-6` (MB) | Dynamic `top-p` (`k̄ ≈ 4.6`, MB) | Notes |
+|---|---:|---:|---|
+| Routed experts (`Q4_0` gate_up + down) | 1,289.95 | ~989 | 6 of 128 (`top-6`) vs `k ∈ [4..6]` (`MIN_K=4, TOP_P=0.72`) |
+| Attention projections (`Q4_0`/`Q8_0`) | 562.49 | 562.49 | 48 visits (`wq`, `wk`, `wv`, `wo`, `wqkv_gate`, `attn_rel`, `sink`) |
+| Target LM Head (`output.weight`, `Q4_0`) | 260.53 | 260.53 | `2304 × 201,024` |
+| Norms, shortconv, loop ctrl, router | 284.56 | 284.56 | `197.86` norms/conv + `56.62` router + `30.08` loop ctrl |
+| **Total `M=1` Target Weights (excl KV)** | **2,397.52** | **~2,097** | **8.55 ms (`116.9 tok/s`)** `top-6` floor / **7.48 ms (`133.7 tok/s`)** dynamic floor @ `280.3 GB/s` |
+
+- **DSpark `Q4_0` + `SHORTLIST=65536` + `-ctkd f16 -ctvd f16`:** Shortlisting reduces `W2` (`Q8_0`) from `201K -> 65K` rows (~17 MB, `0.06 ms`), and F16 draft KV cuts long-context draft attention latency `-20%` (`6.23 -> 5.02 ms` @ 76K). Speculative `M=3..4` (`n_max=3`, `ADAPTIVE_K=1`, `a = 2.0–2.8`) short-context ceiling: **~115–155 tok/s** (and **300–500+ tok/s** on exact `PROMPT_LOOKUP_MAX=15` code copies).
+- **Long-context Global KV Read/Step (`8` global visits, `8` KV heads × `128` dim, F16):**
+  - `152K`: `5.00 GB` (`17.8 ms` KV + `8.55 ms` weights = `26.4 ms` `M=1` floor -> `37.9 tok/s` plain / `~50–60 tok/s` spec ceiling).
+  - `214K`: `7.03 GB` (`25.1 ms` KV + `8.55 ms` weights = `33.7 ms` `M=1` floor -> `29.7 tok/s` plain / `~38–48 tok/s` spec ceiling).
+- **Prefill (`top-6` linear FLOPs = `7.29 GFLOP/tok`, 50% MFU = `14.57 TFLOPS`):**
+  - `4K` (`7.49 GFLOP/tok`): **`1,945 tok/s`** practical ceiling (`1,235 tok/s` achieved = **63.5%** of practical ceiling).
+  - `32K` (`8.90 GFLOP/tok`): **`1,637 tok/s`** practical ceiling (`1,055–1,073 tok/s` achieved = **64.5–65.5%**).
+  - `152K` (`14.77 GFLOP/tok`): **`986 tok/s`** practical ceiling (`727 tok/s` achieved = **73.7%**).
+  - `214K` (`17.82 GFLOP/tok`): **`818 tok/s`** practical ceiling (`614 tok/s` achieved = **75.1%**).

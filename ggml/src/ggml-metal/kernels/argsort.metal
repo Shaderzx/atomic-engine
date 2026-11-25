@@ -540,10 +540,10 @@ kernel void kernel_topk_moe_f32(
 
         if ((k & 31) == lane) {
             output_weights[k / 32] = best_val;
+            ids_row[k] = best_expert;
         }
 
         if ((best_expert & 31) == lane) {
-            ids_row[k] = best_expert;
             if (FC_topk_moe_with_norm) {
                 wt_sum += best_val;
             }
@@ -556,6 +556,22 @@ kernel void kernel_topk_moe_f32(
         const float inv = 1.0f / wt_sum;
         FOR_UNROLL (int i = 0; i < n_per_lane; ++i) {
             output_weights[i] *= inv;
+        }
+        // Optional dynamic top-p expert pruning (decode only, top_k <= 16):
+        // drop tail experts once cumulative normalized weight >= prune_top_p, keeping >= prune_min_k.
+        if (args.prune_min_k > 0 && args.prune_top_p > 0.0f && args.prune_min_k < top_k && top_k <= 16) {
+            const float w_me = (lane < top_k) ? output_weights[0] : 0.0f;
+            const float cum_before = simd_prefix_exclusive_sum(w_me);
+            const bool keep = (lane < args.prune_min_k) || (lane < top_k && cum_before < args.prune_top_p);
+            const float kept_sum = simd_sum(keep ? w_me : 0.0f);
+            if (lane < top_k) {
+                if (!keep) {
+                    ids_row[lane] = -1;
+                    output_weights[0] = 0.0f;
+                } else if (kept_sum > 0.0f) {
+                    output_weights[0] = w_me / kept_sum;
+                }
+            }
         }
     }
 
@@ -588,7 +604,10 @@ kernel void kernel_moe_reduce_f32(
     const int64_t base = token * (int64_t) n_expert_used * args.ne00 + col;
     float sum = 0.0f;
     FOR_UNROLL (int e = 0; e < n_expert_used; ++e) {
-        sum += experts[base + e * args.ne00] * weights[token * n_expert_used + e];
+        const float ew = weights[token * n_expert_used + e];
+        if (ew != 0.0f) {
+            sum += experts[base + e * args.ne00] * ew;
+        }
     }
     dst[token * args.ne00 + col] = sum;
 }
