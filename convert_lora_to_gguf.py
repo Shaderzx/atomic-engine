@@ -422,6 +422,9 @@ if __name__ == '__main__':
             def set_vocab(self):
                 pass
 
+            def dequant_model(self):
+                pass
+
             def set_type(self):
                 self.gguf_writer.add_type(gguf.GGUFType.ADAPTER)
                 self.gguf_writer.add_string(gguf.Keys.Adapter.TYPE, "lora")

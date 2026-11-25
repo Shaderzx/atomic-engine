@@ -188,6 +188,20 @@ class Inkling2Model(TextModel):
         if any(p in name for p in ("visual.", "vision_tower.", "mtp.", "markov_head", "nextn_predict")):
             return None
         name = name.replace("model.language_model.", "model.").replace("model.llm.", "model.")
+        # transformers 5.24 Inkling2Loop wrapper submodule names -> canonical GGUF tensor_mapping names
+        name = (
+            name.replace(".self_attn.q_proj.linear", ".self_attn.q_proj")
+            .replace(".self_attn.k_proj.linear", ".self_attn.k_proj")
+            .replace(".self_attn.v_proj.linear", ".self_attn.v_proj")
+            .replace(".self_attn.o_proj.linear", ".self_attn.o_proj")
+            .replace(".self_attn.o_proj.gate_proj", ".attn.gate_attn")
+            .replace(".self_attn.relative_position_bias.linear", ".self_attn.r_proj")
+            .replace(".self_attn.k_proj.sconv.", ".self_attn.k_sconv.")
+            .replace(".self_attn.v_proj.sconv.", ".self_attn.v_sconv.")
+            .replace("_message_gate.down_proj", "_controller.down_proj")
+            .replace("_message_gate.message_gate_proj", "_controller.gain_proj")
+            .replace("_message_gate.forget_gate_proj", "_controller.forget_proj")
+        )
         # the mapping table cannot shift a block index: attn_queries.{i} feeds block i + 1
         name = re.sub(r"attn_res\.attn_queries\.(\d+)", lambda m: f"layers.{int(m[1]) + 1}.attention_input.query", name)
         # the table maps a module, not its bias: gate.weight is the router, gate.bias the score correction
