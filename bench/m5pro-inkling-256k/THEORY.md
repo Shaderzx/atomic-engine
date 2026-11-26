@@ -127,3 +127,10 @@ Exact tensor byte counts parsed from `Inkling-2-Mini-M5-Q4_0Pure-Uncensored.gguf
   - `32K` (`8.90 GFLOP/tok`): **`1,637 tok/s`** practical ceiling (`1,055–1,073 tok/s` achieved = **64.5–65.5%**).
   - `152K` (`14.77 GFLOP/tok`): **`986 tok/s`** practical ceiling (`727 tok/s` achieved = **73.7%**).
   - `214K` (`17.82 GFLOP/tok`): **`818 tok/s`** practical ceiling (`614 tok/s` achieved = **75.1%**).
+
+## 7. Wave E6 Metal 4 Tensor FA Decode & Domain-Shortlist Roofline (2026-11-26)
+
+- **Why scalar `fa_aux` decode collapsed at `M >= 4`:** Holding `o_reg[3*BQ]` + `q_reg[3*BQ]` + `M/S/sink` in registers exceeds Apple10's zero-spill register budget at `BQ >= 4`, causing `4.9×` slowdown at `n_q=4` (`188.2 ms` vs `38.4 ms` at `n_q=1` for 8L × `262K` F16 KV) and `13.2×` at `n_q=8` (`505.4 ms`).
+- **Metal 4 GQA-Packed Split-K Tensor Decode (`fa_tensor.metal`):** Packing `BQ=5` queries × `3` GQA heads (`15 <= Q=16`, `10.9 KB` smem, 3 TGs/core) executes `Q*K^T` and `P*V` on the 29.14 TFLOPS Metal 4 Neural Accelerators with zero spill, restoring near-bandwidth-ceiling attention (`20.7 ms` @ 128K, `46.1 ms` @ 256K F16 — `4.1×–5.9×` faster than scalar `BQ=4`, and `1.79×` faster even on 40L SWA `2048` cells!).
+- **Domain-Calibrated DSpark Shortlist (`K=24,576`):** `8,643` unique tokens covered `100.00%` of Shad's `880,570` real generated tokens; `K=24,576` cuts `output_short` `85 -> 32 MB` and `w2_fast` `17 -> 6.4 MB` per draft step (`2.67×` reduction), making `n_max=4` (`n_q=5`, exact `Q=16` fit) cheaper per draft than old `n_max=3, K=65536`.
+- **Host Power Mode Discovery:** During Wave E6 benchmarking, macOS AC power was in `powermode = 1` (Low Power Mode, `isLowPowerModeEnabled = true`), halving GPU clocks (~`140 GB/s` effective vs `280.3 GB/s` in `powermode = 2`). Relative Wave E6 gains (`+50.7%` weighted real-workload, `+71.9%` at `102K`, `+41.7%` at `255K`) hold across all power modes and compound directly with switching AC Energy Mode back to Automatic/High Power (~`2×` additional clock headroom).

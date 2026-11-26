@@ -6,6 +6,8 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdlib>
+#include <cstring>
 
 //
 // llama_kv_cache_iswa
@@ -97,10 +99,16 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
             v_trans, offload, unified, size_base, n_seq_max,
             0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
 
-    LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells\n", __func__, size_swa);
+    const char * swa_f16_env = std::getenv("LLAMA_INKLING_SWA_KV_F16");
+    const bool force_swa_f16 = swa_f16_env && std::strcmp(swa_f16_env, "1") == 0;
+    const ggml_type swa_type_k = force_swa_f16 ? GGML_TYPE_F16 : type_k;
+    const ggml_type swa_type_v = force_swa_f16 ? GGML_TYPE_F16 : type_v;
+
+    LLAMA_LOG_INFO("%s: creating     SWA KV cache, size = %u cells (%s/%s)\n", __func__, size_swa,
+            ggml_type_name(swa_type_k), ggml_type_name(swa_type_v));
 
     kv_swa = std::make_unique<llama_kv_cache>(
-            model, no_alloc, hparams, type_k, type_v,
+            model, no_alloc, hparams, swa_type_k, swa_type_v,
             v_trans, offload, unified, size_swa, n_seq_max,
             hparams.n_swa, hparams.swa_type, mem_other_swa, filter_swa, reuse, share);
 }

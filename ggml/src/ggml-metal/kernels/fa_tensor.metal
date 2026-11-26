@@ -649,4 +649,366 @@ template [[host_name("kernel_inkling_fa_tensor_q8_0_q4_0")]] kernel void kernel_
 template [[host_name("kernel_inkling_fa_tensor_f16_q8_0")]]  kernel void kernel_inkling_fa_tensor_impl<16, 0, 1>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
 template [[host_name("kernel_inkling_fa_tensor_f16_q4_0")]]  kernel void kernel_inkling_fa_tensor_impl<16, 0, 2>(constant inkling_fa_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, threadgroup char *, uint2, ushort, ushort);
 
+// GQA-packed (3 Q heads per KV head), split-K Metal 4 Tensor decode attention for Inkling2.
+// Packs BQ queries x 3 GQA heads into one Q-row tile (Q=16 for BQ=5, Q=32 for BQ=10) so
+// speculative verify batches (n_q=2..15) execute Q*K^T and P*V on Metal 4 Neural Accelerators
+// with zero register spill, eliminating the 4.9x-13x register-spill cliff of scalar BQ>=4 decode.
+struct inkling_fa_decode_tensor_args {
+    uint32_t n_q;
+    uint32_t n_kv;
+    uint32_t extent;
+    uint32_t n_swa;
+    uint32_t nb11;
+    uint32_t nb12;
+    uint32_t nb21;
+    uint32_t nb22;
+    uint32_t nwg;
+    uint32_t has_gate;
+    float    scale;
+};
+
+template <short Q, int K_KIND, int V_KIND>
+kernel void kernel_inkling_fa_decode_tensor_impl(
+        constant inkling_fa_decode_tensor_args & args [[buffer(0)]],
+        device const float  * q      [[buffer(1)]],
+        device const char   * k      [[buffer(2)]],
+        device const char   * v      [[buffer(3)]],
+        device const float  * table  [[buffer(4)]],
+        device const float  * sinks  [[buffer(5)]],
+        device const int    * q_pos  [[buffer(6)]],
+        device const int    * k_pos  [[buffer(7)]],
+        device       float  * dst    [[buffer(8)]],
+        device       float  * tmp    [[buffer(9)]],
+        device const float4 * gate   [[buffer(10)]],
+        threadgroup  char   * shmem  [[threadgroup(0)]],
+        uint3  tgpig [[threadgroup_position_in_grid]],
+        ushort tiisg [[thread_index_in_simdgroup]],
+        ushort sgitg [[simdgroup_index_in_threadgroup]]) {
+    constexpr short DK  = 128;
+    constexpr short DV  = 128;
+    constexpr short C   = 64;
+    constexpr short NSG = 4;
+    constexpr short NW  = 32;
+    constexpr short NT  = NW * NSG;
+    constexpr short NQ  = Q / NSG;
+    constexpr short NC  = C / NW;
+    constexpr uint  BQ  = (uint)(Q / 3); // 5 for Q=16 (15 rows), 10 for Q=32 (30 rows)
+    constexpr uint  SPLIT_STRIDE = 132u;
+    constexpr float LOG2E = 1.4426950408889634f;
+
+    const uint q0      = tgpig.x * BQ;
+    const uint kv_head = tgpig.y;
+    const uint iwg     = tgpig.z;
+    const uint nwg     = args.nwg;
+    const ushort tiitg = sgitg * NW + tiisg;
+    const uint extent  = args.extent;
+    const int  n_swa   = (int)args.n_swa;
+    const float q_scale = args.scale * LOG2E;
+
+    // Identical layout to ggml_metal_inkling_fa_tensor_smem(Q, has_skv).
+    threadgroup half  * sq      = (threadgroup half  *) shmem;             // [Q, 128]
+    threadgroup float * ss      = (threadgroup float *) (sq + Q * DK);     // [Q, 64]
+    threadgroup half  * sp      = (threadgroup half  *) (ss + Q * C);      // [Q, 64]
+    threadgroup float * sr      = (threadgroup float *) (sp + Q * C);      // [Q]
+    threadgroup int   * sf      = (threadgroup int   *) (sr + Q);          // [4]
+    threadgroup int   * kpos_tg = (threadgroup int   *) (sf + 4);          // [64]
+    threadgroup ulong * kseq_tg = (threadgroup ulong *) (kpos_tg + C);     // [64]
+    threadgroup half  * skv     = (threadgroup half  *) (kseq_tg + C);     // [64, 128] (KV_KIND != 0)
+
+    for (uint i = tiitg; i < (uint)(Q * DK / 4); i += NT) {
+        const uint j  = i / (DK / 4);
+        const uint d4 = i % (DK / 4);
+        const uint qi = j / 3u;
+        const uint g  = j % 3u;
+        const uint q_idx = q0 + qi;
+        float4 q4 = 0.0f;
+        if (qi < BQ && q_idx < args.n_q) {
+            const uint head = kv_head * 3u + g;
+            q4 = ((device const float4 *)(q + ((uint64_t)q_idx * 24u + head) * DK))[d4];
+        }
+        ((threadgroup half4 *) sq)[i] = (half4)(q4 * q_scale);
+    }
+
+    int   qpos_r[NQ];
+    ulong qbit_r[NQ];
+    float sink_r[NQ];
+    float far_bias_r[NQ];
+    float M[NQ];
+    float S[NQ];
+    int   my_min_qp = INT_MAX;
+    int   my_max_qp = INT_MIN;
+    ulong my_seq_mask = 0ULL;
+    int   my_seq_invalid = 0;
+
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        const uint j  = (uint)(jj * NSG + sgitg);
+        const uint qi = j / 3u;
+        const uint g  = j % 3u;
+        const uint q_idx = q0 + qi;
+        if (qi < BQ && q_idx < args.n_q) {
+            const int qp = q_pos[q_idx * 2u];
+            const uint qseq = (uint)q_pos[q_idx * 2u + 1u];
+            const ulong qbit = qseq < 64u ? (1ULL << qseq) : 0ULL;
+            if (qseq >= 64u) { my_seq_invalid = 1; }
+            qpos_r[jj] = qp;
+            qbit_r[jj] = qbit;
+            my_seq_mask |= qbit;
+            my_min_qp = min(my_min_qp, qp);
+            my_max_qp = max(my_max_qp, qp);
+            const uint head = kv_head * 3u + g;
+            const uint qh = q_idx * 24u + head;
+            const float sk_val = sinks[qh] * LOG2E;
+            sink_r[jj] = sk_val;
+            far_bias_r[jj] = -sk_val;
+        } else {
+            qpos_r[jj] = -1;
+            qbit_r[jj] = 0ULL;
+            sink_r[jj] = 0.0f;
+            far_bias_r[jj] = 0.0f;
+        }
+        M[jj] = -FLT_MAX / 2.0f;
+        S[jj] = 0.0f;
+    }
+
+    if (tiisg == 0) {
+        kpos_tg[sgitg]     = my_min_qp;
+        kpos_tg[sgitg + 4] = my_max_qp;
+        kpos_tg[sgitg + 8] = my_seq_invalid;
+        kseq_tg[sgitg]     = my_seq_mask;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const int   tg_min_qp     = min(min(kpos_tg[0], kpos_tg[1]), min(kpos_tg[2], kpos_tg[3]));
+    const int   tg_max_qp     = max(max(kpos_tg[4], kpos_tg[5]), max(kpos_tg[6], kpos_tg[7]));
+    const bool  tg_any_inval  = (kpos_tg[8] | kpos_tg[9] | kpos_tg[10] | kpos_tg[11]) != 0;
+    const ulong tg_seq_mask   = kseq_tg[0] | kseq_tg[1] | kseq_tg[2] | kseq_tg[3];
+    const bool  tg_single_seq = !tg_any_inval && (tg_seq_mask != 0ULL) && ((tg_seq_mask & (tg_seq_mask - 1ULL)) == 0ULL);
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tq = tensor(sq, dextents<int32_t, 2>(DK, Q));
+    auto ts = tensor(ss, dextents<int32_t, 2>(C,  Q));
+    auto tp = tensor(sp, dextents<int32_t, 2>(C,  Q));
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(Q, C, DK, false, true, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply),
+        execution_simdgroups<NSG>> mm_qk;
+
+    mpp::tensor_ops::matmul2d<
+        mpp::tensor_ops::matmul2d_descriptor(Q, DV, C, false, false, false, mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<NSG>> mm_pv;
+
+    const int sk_f16 = (int)(args.nb12 / sizeof(half));
+    const int sv_f16 = (int)(args.nb22 / sizeof(half));
+    device const char * k_base = k + (uint64_t)kv_head * args.nb11;
+    device const char * v_base = v + (uint64_t)kv_head * args.nb21;
+
+    auto tv_dev0 = tensor((device half *)v_base, dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv_f16}));
+    auto tv_tg0  = tensor(skv, dextents<int32_t, 2>(DV, C));
+    using tv_ref_t = conditional_t<V_KIND == 0, decltype(tv_dev0), decltype(tv_tg0)>;
+    auto co = mm_pv.template get_destination_cooperative_tensor<decltype(tp), tv_ref_t, float>();
+    FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
+        if (co.is_valid_element(i)) {
+            co[i] = 0.0f;
+        }
+    }
+
+    // Contiguous split-K over aligned 64-key tiles (args.n_kv is guaranteed multiple of 64).
+    const uint n_tiles      = args.n_kv / (uint)C;
+    const uint tiles_per_wg = (n_tiles + nwg - 1u) / nwg;
+    const uint t_beg        = iwg * tiles_per_wg;
+    const uint t_end        = min(n_tiles, t_beg + tiles_per_wg);
+
+    for (uint it = t_beg; it < t_end; ++it) {
+        const uint ic = it * (uint)C;
+        if (tiitg < 64u) {
+            const uint kbase = (ic + tiitg) * 3u;
+            const int kp = k_pos[kbase];
+            const ulong kmask = ulong(uint(k_pos[kbase + 1u])) | (ulong(uint(k_pos[kbase + 2u])) << 32);
+            kpos_tg[tiitg] = kp;
+            kseq_tg[tiitg] = kmask;
+            const bool seq_hit = (kmask & tg_seq_mask) != 0ULL;
+            const bool vis = (kp >= 0) && seq_hit && (kp <= tg_max_qp) && (n_swa == 0 || kp > tg_min_qp - n_swa);
+            const bool far_ok = (n_swa == 0) && tg_single_seq && (kp >= 0) && seq_hit && (kp <= tg_min_qp - (int)extent);
+            const bool sg_any_vis = simd_any(vis);
+            const bool sg_all_far = simd_all(far_ok);
+            if (tiisg == 0) {
+                sf[1 + sgitg] = (sg_any_vis ? 1 : 0) | (sg_all_far ? 2 : 0);
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int flags = (sf[1] | sf[2]);
+        if ((flags & 1) == 0) {
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            continue;
+        }
+        const bool all_far = ((sf[1] & 2) != 0) && ((sf[2] & 2) != 0);
+
+        if constexpr (K_KIND == 0) {
+            auto tk = tensor((device half *)(k_base + (uint64_t)ic * args.nb12), dextents<int32_t, 2>(DK, C), array<int, 2>({1, sk_f16}));
+            mm_qk.run(tq, tk, ts);
+        } else if constexpr (K_KIND == 1) {
+            inkling_fa_stage_kv_q8_0(skv, k, ic, kv_head, args.nb11, args.nb12, tiitg);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto tk = tensor(skv, dextents<int32_t, 2>(DK, C));
+            mm_qk.run(tq, tk, ts);
+        } else {
+            inkling_fa_stage_kv_q4_0(skv, k, ic, kv_head, args.nb11, args.nb12, tiitg);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto tk = tensor(skv, dextents<int32_t, 2>(DK, C));
+            mm_qk.run(tq, tk, ts);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if constexpr (V_KIND == 1) {
+            inkling_fa_stage_kv_q8_0(skv, v, ic, kv_head, args.nb21, args.nb22, tiitg);
+        } else if constexpr (V_KIND == 2) {
+            inkling_fa_stage_kv_q4_0(skv, v, ic, kv_head, args.nb21, args.nb22, tiitg);
+        }
+
+        int sg_upd = 0;
+        FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+            const uint j  = (uint)(jj * NSG + sgitg);
+            const uint qi = j / 3u;
+            const uint g  = j % 3u;
+            const uint q_idx = q0 + qi;
+            const bool q_valid = (qi < BQ) && (q_idx < args.n_q);
+
+            float s[NC];
+            if (!q_valid) {
+                FOR_UNROLL (short ii = 0; ii < NC; ++ii) { s[ii] = -INFINITY; }
+            } else if (all_far) {
+                const float fb = far_bias_r[jj];
+                FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                    s[ii] = ss[j * C + ii * NW + tiisg] + fb;
+                }
+            } else {
+                const int qp = qpos_r[jj];
+                const ulong qbit = qbit_r[jj];
+                const float sk_val = sink_r[jj];
+                const uint head = kv_head * 3u + g;
+                const uint64_t tbl_off = (uint64_t)(q_idx * 24u + head) * extent;
+                FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                    const uint col = ii * NW + tiisg;
+                    const int kp = kpos_tg[col];
+                    const int d = qp - kp;
+                    if (kp < 0 || (kseq_tg[col] & qbit) == 0ULL || d < 0 || (n_swa > 0 && d >= n_swa)) {
+                        s[ii] = -INFINITY;
+                    } else {
+                        const float rel = (uint)d < extent ? table[tbl_off + (uint)d] * LOG2E : 0.0f;
+                        s[ii] = ss[j * C + col] + (rel - sk_val);
+                    }
+                }
+            }
+
+            float m = M[jj];
+            FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                m = max(m, s[ii]);
+            }
+            m = simd_max(m);
+
+            float ms = 1.0f;
+            if (m > M[jj]) {
+                ms = exp2(M[jj] - m);
+                M[jj] = m;
+                sg_upd = 1;
+            }
+
+            float sum = 0.0f;
+            FOR_UNROLL (short ii = 0; ii < NC; ++ii) {
+                const half p = (half)exp2(s[ii] - M[jj]);
+                sp[j * C + ii * NW + tiisg] = p;
+                sum += (float)p;
+            }
+            S[jj] = S[jj] * ms + simd_sum(sum);
+
+            if (tiisg == 0) {
+                sr[j] = ms;
+            }
+        }
+        if (tiisg == 0) {
+            sf[sgitg] = sg_upd;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if ((sf[0] | sf[1] | sf[2] | sf[3]) != 0) {
+            FOR_UNROLL (short i = 0; i < co.get_capacity(); ++i) {
+                if (co.is_valid_element(i)) {
+                    co[i] *= sr[co.get_multidimensional_index(i)[1]];
+                }
+            }
+        }
+
+        if constexpr (V_KIND == 0) {
+            auto tv = tensor((device half *)(v_base + (uint64_t)ic * args.nb22), dextents<int32_t, 2>(DV, C), array<int, 2>({1, sv_f16}));
+            mm_pv.run(tp, tv, co);
+        } else {
+            auto tv = tensor(skv, dextents<int32_t, 2>(DV, C));
+            mm_pv.run(tp, tv, co);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Reuse shmem to unpack cooperative tensor [DV, Q] + M/S into coalesced float4 writes.
+    // Q=16 uses 8,320 B <= 10,944 B; Q=32 uses 16,640 B <= 20,992 B.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float * so     = (threadgroup float *) shmem;
+    threadgroup float * sm_out = so + Q * DV;
+    threadgroup float * ss_out = sm_out + Q;
+
+    auto to = tensor(so, dextents<int32_t, 2>(DV, Q));
+    co.store(to);
+    FOR_UNROLL (short jj = 0; jj < NQ; ++jj) {
+        if (tiisg == 0) {
+            const uint j = (uint)(jj * NSG + sgitg);
+            sm_out[j] = M[jj];
+            ss_out[j] = S[jj];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint j = sgitg; j < BQ * 3u; j += (uint)NSG) {
+        const uint qi = j / 3u;
+        const uint g  = j % 3u;
+        const uint q_idx = q0 + qi;
+        if (q_idx >= args.n_q) { continue; }
+        const uint head = kv_head * 3u + g;
+        const float4 o4 = ((threadgroup const float4 *)(so + j * DV))[tiisg];
+        const float m_all = sm_out[j];
+        const float s_all = ss_out[j];
+        if (nwg == 1u) {
+            const float mf = max(m_all, 0.0f);
+            const float corr = exp2(m_all - mf);
+            const float denom = s_all * corr + exp2(-mf);
+            const float inv = denom == 0.0f ? 0.0f : corr / denom;
+            const uint64_t out_off4 = ((uint64_t)q_idx * 24u + head) * 32u + tiisg;
+            float4 out4 = o4 * inv;
+            if (args.has_gate) {
+                const float4 g4 = gate[out_off4];
+                out4 *= 1.0f / (1.0f + exp(-g4));
+            }
+            ((device float4 *)dst)[out_off4] = out4;
+        } else {
+            device float * out_part = tmp + (((uint64_t)q_idx * 24u + head) * nwg + iwg) * SPLIT_STRIDE;
+            ((device float4 *)out_part)[tiisg] = o4;
+            if (tiisg == 0) {
+                out_part[128] = m_all;
+                out_part[129] = s_all;
+            }
+        }
+    }
+}
+
+template [[host_name("kernel_inkling_fa_decode_tensor_f16_q16")]]       kernel void kernel_inkling_fa_decode_tensor_impl<16, 0, 0>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_f16_q32")]]       kernel void kernel_inkling_fa_decode_tensor_impl<32, 0, 0>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_q8_0_q16")]]      kernel void kernel_inkling_fa_decode_tensor_impl<16, 1, 1>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_q4_0_q16")]]      kernel void kernel_inkling_fa_decode_tensor_impl<16, 2, 2>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_q8_0_q4_0_q16")]] kernel void kernel_inkling_fa_decode_tensor_impl<16, 1, 2>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_f16_q8_0_q16")]]  kernel void kernel_inkling_fa_decode_tensor_impl<16, 0, 1>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+template [[host_name("kernel_inkling_fa_decode_tensor_f16_q4_0_q16")]]  kernel void kernel_inkling_fa_decode_tensor_impl<16, 0, 2>(constant inkling_fa_decode_tensor_args &, device const float *, device const char *, device const char *, device const float *, device const float *, device const int *, device const int *, device float *, device float *, device const float4 *, threadgroup char *, uint3, ushort, ushort);
+
 #endif // GGML_METAL_HAS_TENSOR

@@ -191,11 +191,17 @@ int main(int argc, char ** argv) {
             bool include_all_masked;
         };
         const std::vector<fa_case> cases = {
-            // Decode (n_q < 16), BQ in {1,2,3,4}, nwg=1 (64), 4 (640), 16 (4160), 32 (33024), 64 (65600), and mixed K/V
+            // Decode (n_q < 16), BQ in {1..8}, nwg=1 (64), 4 (640), 16 (4160), 32 (33024), 64 (65600), 128 (131200), and mixed K/V
             {"dec_q1_f16_nwg1",     GGML_TYPE_F16,  GGML_TYPE_F16,   1,    64,  32,    0, 1, false},
             {"dec_q2_f16_split4",   GGML_TYPE_F16,  GGML_TYPE_F16,   2,   640,  64,    0, 1, false},
             {"dec_q3_f16_split4",   GGML_TYPE_F16,  GGML_TYPE_F16,   3,   640,  64,    0, 1, false},
             {"dec_q4_q8_split4",    GGML_TYPE_Q8_0, GGML_TYPE_Q8_0,  4,   640,  64,  256, 1, false},
+            {"dec_q5_f16_split4",   GGML_TYPE_F16,  GGML_TYPE_F16,   5,   640,  64,    0, 1, false},
+            {"dec_q6_q8q4_split16", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,  6,  4160,  64,    0, 1, false},
+            {"dec_q7_f16q4_split4", GGML_TYPE_F16,  GGML_TYPE_Q4_0,  7,   640,  64,  256, 1, false},
+            {"dec_q8_q4_split16",   GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,  8,  4160,  64,    0, 2, true },
+            {"dec_q8_f16_split64",  GGML_TYPE_F16,  GGML_TYPE_F16,   8, 65600,  64,    0, 1, false},
+            {"dec_q5_f16_split128", GGML_TYPE_F16,  GGML_TYPE_F16,   5,131200,  64,    0, 1, false},
             {"dec_q3_q8q4_split16", GGML_TYPE_Q8_0, GGML_TYPE_Q4_0,  3,  4160,  64,    0, 1, false},
             {"dec_q3_q4_split16",   GGML_TYPE_Q4_0, GGML_TYPE_Q4_0,  3,  4160,  64,    0, 1, false},
             {"dec_q1_f16_split32",  GGML_TYPE_F16,  GGML_TYPE_F16,   1, 33024,  64,    0, 1, false},
@@ -671,7 +677,7 @@ int main(int argc, char ** argv) {
         t.assert_true(create_gated != nullptr);
 
         for (ggml_type kv_type : {GGML_TYPE_F16, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0}) {
-            for (auto [n_q, n_kv] : std::vector<std::pair<int64_t, int64_t>>{{1, 256}, {5, 1024}}) {
+            for (auto [n_q, n_kv] : std::vector<std::pair<int64_t, int64_t>>{{1, 256}, {5, 1024}, {8, 1024}}) {
                 const int32_t extent = 64;
                 const int32_t n_swa = 0;
                 const float scale = 1.0f / std::sqrt(128.0f);

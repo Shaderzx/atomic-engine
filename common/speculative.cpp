@@ -1517,14 +1517,28 @@ protected:
     }
 
     // O(1) incremental 4-gram hash-indexed suffix lookup across the entire 256K+ history.
-    // The target always verifies every proposed token losslessly, just like a DSpark block.
+    // The target always verifies every proposed token losslessly (via sample-and-match when
+    // temp > 0, identical to draft-dspark which never populates dp.result_q).
     bool draft_from_prompt(common_speculative_draft_params & dp) const {
-        if (!dp.prompt || dp.result_q || lookup_table.empty()) {
+        if (!dp.prompt || lookup_table.empty()) {
+            return false;
+        }
+        static const int32_t sampled_mode = []() {
+            const char * v = std::getenv("LLAMA_INKLING_PROMPT_LOOKUP_SAMPLED");
+            return v ? std::atoi(v) : 1;
+        }();
+        if (dp.temp > 0.0f && sampled_mode == 0) {
             return false;
         }
         const auto & history = *dp.prompt;
         const size_t L = history.size();
-        const size_t min_suffix = dp.temp <= 0.0f ? 5 : 8;
+        static const int32_t env_min_suffix = []() {
+            const char * v = std::getenv("LLAMA_INKLING_PROMPT_LOOKUP_MIN_SUFFIX");
+            return v ? std::atoi(v) : 0;
+        }();
+        const size_t min_suffix = env_min_suffix > 0
+            ? (size_t) env_min_suffix
+            : (dp.temp <= 0.0f ? 5u : 8u);
         if (L < min_suffix + 1) {
             return false;
         }
@@ -1578,10 +1592,13 @@ protected:
             return false;
         }
 
-        // Scale proposed draft length with matched suffix confidence so short 5-7 token
-        // code-edit matches verify cheaply (d=0ms) while >=8 token matches hit mul_mm_id (15 tokens).
+        // Scale proposed draft length with matched suffix confidence.
+        // For temp > 0, keep medium matches (8..15) aligned with params.n_max to avoid Metal graph
+        // realloc thrashing & MoE burst waste, bursting to cap_max only on verbatim >=16-token copies.
         const int32_t cap_max   = prompt_lookup_max > 0 ? prompt_lookup_max : params.n_max;
-        const int32_t conf_cap  = best_matched >= 8 ? cap_max : (best_matched >= 6 ? std::min(cap_max, 8) : std::min(cap_max, 4));
+        const int32_t conf_cap  = dp.temp > 0.0f
+            ? (best_matched >= 16 ? cap_max : std::min(cap_max, params.n_max))
+            : (best_matched >= 8 ? cap_max : (best_matched >= 6 ? std::min(cap_max, 7) : std::min(cap_max, 4)));
         const int32_t max_count = dp.n_max < 0 ? conf_cap : std::min(dp.n_max, conf_cap);
         const int32_t avail     = (int32_t) std::min<size_t>(L - best_end, (size_t) std::max(0, max_count));
         const int32_t count     = avail;
@@ -1747,7 +1764,27 @@ public:
                                 conf[k] = 1.0f / (1.0f + std::exp(-m));
                             }
                             if (offered >= (size_t) params.n_min) {
-                                result.resize(atomic_depth->choose(conf.data(), offered, params.n_min, dp.atomic_verify_row_cost, 0.15f));
+                                static const bool ctx_adapt = []() {
+                                    const char * v = std::getenv("LLAMA_INKLING_ADAPTIVE_CTX");
+                                    return v && std::strcmp(v, "1") == 0;
+                                }();
+                                float row_cost = dp.atomic_verify_row_cost;
+                                float draft_ratio = 0.15f;
+                                if (ctx_adapt) {
+                                    // At long context (single-pass BQ<=8 FA), KV bandwidth is amortized
+                                    // across all query rows so marginal verify row cost & draft ratio drop.
+                                    const float ctx_prior = dp.pos0 >= 65536 ? 0.10f
+                                                          : (dp.pos0 >= 16384 ? 0.16f : 0.24f);
+                                    draft_ratio = dp.pos0 >= 65536 ? 0.06f
+                                                : (dp.pos0 >= 16384 ? 0.10f : 0.15f);
+                                    if (row_cost < 0.0f) {
+                                        row_cost = ctx_prior;
+                                    } else {
+                                        // Cap pessimistic early-turn default prior (0.50) at long context.
+                                        row_cost = std::min(row_cost, ctx_prior * 1.5f);
+                                    }
+                                }
+                                result.resize(atomic_depth->choose(conf.data(), offered, params.n_min, row_cost, draft_ratio));
                             }
                         }
                     }

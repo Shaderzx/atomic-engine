@@ -115,3 +115,28 @@ Applying Exstill (`arXiv:2611.18859v1`) systems, Metal 4 kernel, speculative dec
 5. **EXP-5 (ACCEPTED — PARETO CHAMPION) — Decode-Only Dynamic `top-p` MoE (`MIN_K=4, TOP_P=0.72`):**
    - Opt-in (`LLAMA_INKLING_MOE_MIN_K`, `LLAMA_INKLING_MOE_TOP_P`, default OFF), strictly guarded in `ggml_metal_op_topk_moe` by `gating == 1` + forward graph consumer verification (`inkling_moe_ffn` only, auto-disables when Songe attaches `--lora` or `mul_mm_id` runs).
    - Passed Ashhart `quant-autopsy` (`LOSSLESS_TIER` / `PARETO`: `14/17 = 82.4%`, `100.0%` retention vs lossless across all 6 categories, `84.3` vs `77.2 tok/s`), `eval_coding_quality.py` **`10/10` (`94.32 tok/s` median, `111.3` peak)**, `152K` & `214K` **`3/3` exact needles**, and Ashhart `think-governor` calibration (`--reasoning-effort low --reasoning-budget 4096` + `pi` `defaultThinkingLevel: "low"`, cutting thinking tokens `-33.9%` and preventing 28K-token runaway loops).
+
+## Wave E6 — Data-Driven Real-Workload Overclock & Metal 4 Tensor FA Decode (`EXP-6..EXP-8`, 2026-11-26)
+
+Grounded in 9.5 hours of live Songe telemetry (`865` real `pi` exchanges, `880,570` generated tokens, `98.46%` KV cache hits, `83.0%` of outputs at `32K–256K`, `60.4%` at `64K–256K`, only `8,643` unique tokens covering `100.00%` of output):
+
+1. **EXP-6A (ACCEPTED) — Zero-Realloc Sampled Prompt Lookup (`common/speculative.cpp`):**
+   - Fixed live bug where `dp.result_q` (passed whenever `temp > 0`, even though `draft-dspark` never populates it) killed prompt lookup on 100% of real `pi` turns (`0` accepted tokens at `pos 3..14` across `197,630` rounds).
+   - Tuned `temp > 0` confidence tiers (`min_suffix = 8`, medium matches `8..15` aligned to `params.n_max` for zero Metal graph reallocs, verbatim `>= 16` bursting to `cap_max = 15`), curing the 210-realloc thrashing seen with naive `min_suffix = 6`.
+2. **EXP-6C (ACCEPTED) — Domain-Calibrated DSpark Vocab Shortlist (`src/models/inkling2-dspark.cpp`, `dspark-shortlist-pi.txt`):**
+   - Added `LLAMA_INKLING_DSPARK_SHORTLIST_FILE` loader with `markov_w2_b` fallback. At `K = 24,576`, covers `100.00%` of Shad's `880K` real coding/tool tokens plus `16K` general-English safety buffer, cutting draft LM-head bytes **2.67×** (`85 MB -> 32 MB`, `w2_fast` `17 MB -> 6.4 MB`) and beating `K = 65,536` across `c1`, `short`, and `32k` (`K = 16,384` rejected due to `-2.25 tok/s` dip on general prose).
+3. **EXP-7/8 (ACCEPTED — MASSIVE BREAKTHROUGH) — GQA-Packed Split-K Metal 4 Tensor FA Decode (`ggml/src/ggml-metal/kernels/fa_tensor.metal`, `ggml-metal-ops.cpp`, `ggml-metal-expert.h`):**
+   - Direct kernel microbenchmarking revealed a **4.9×–13× register-spill cliff** in scalar `kernel_inkling_fa_decode_impl` for `BQ >= 4` (`188.19 ms` at `262K` `n_q=4` vs `38.42 ms` at `n_q=1`; `505.44 ms` at `n_q=8`).
+   - Built `kernel_inkling_fa_decode_tensor_impl<Q, K_KIND, V_KIND>` packing `BQ` queries × `3` GQA heads into Metal 4 `mpp::tensor_ops::matmul2d` tiles (`Q=16` for `BQ=5`, `10.9 KB` smem, 3 TGs/core; `Q=32` for `BQ=10` F16), with aligned 64-key split-K up to `nwg = 128` (`GGML_METAL_INKLING_FA_SPLIT_MAX_NWG = 128`), `exp2` online softmax, and zero-copy `shmem` cooperative-tensor unpack into the existing `kernel_inkling_fa_decode_reduce`.
+   - Slashed lossless `F16/F16` attention latency **1.79× on 40L SWA (`27.08 -> 15.14 ms`)**, **5.94× at `65K` (`66.49 -> 11.19 ms`)**, **4.74× at `131K` (`98.29 -> 20.74 ms`)**, and **4.09× at `262K` (`188.19 -> 46.05 ms`, `8.55×` at `n_q=8`)** — making lossless `F16/F16` KV faster than quantized KV (`Q8_0/Q4_0` / `Q4_0/Q4_0`) up through `131K` with zero KV quality loss and fastest prefill!
+4. **EXP-8C (ACCEPTED — WAVE E6 CHAMPION) — `n_max = 4` (`n_q = 5`, Exact `Q = 16` Occupancy Fit) + Context-Aware `ADAPTIVE_CTX = 1`:**
+   - Swept `n_max ∈ {3, 4, 5, 7}` on Metal 4 Tensor FA decode: `n_max = 4` (`5 × 3 = 15 <= 16`) fits cleanly in the high-occupancy `Q = 16` kernel while unlocking `pos 3` (`52.4%` acceptance at `102K`, lifting `mean_len` to `4.05`).
+   - Apples-to-apples real-workload gains vs Wave E5 (measured under identical `powermode = 1` AC clocks, `therm = 100 -> 100`):
+     - `coding` (`10/10` PASS): `34.45 -> 40.35 tok/s` (**`+17.1%`**, `refactor` `+23.1%`)
+     - `short` (`18.8–22.4K` real `pi`): `29.03 -> 39.70 tok/s` (**`+36.8%`**)
+     - `32k` (`37.1–50.5K` real `pi`): `27.08 -> 33.50 tok/s` (**`+23.7%`**)
+     - `102k` (`102.2–110.5K` real `pi`): `18.77 -> 32.26 tok/s` (**`+71.9%`**, peak turn `38.36 = 2.04×`)
+     - `181K` (`3/3` needles): `18.67 tok/s` warm decode (`25.0 GiB` RSS)
+     - `255K` (`254,920` tokens, `3/3` needles): `9.40 -> 13.32 tok/s` (**`+41.7%`**, `32.1 GiB` peak RSS)
+     - Real-workload weighted average across Shad's 865-exchange distribution: **`22.39 -> 33.74 tok/s` (`+50.7%`)**.
+   - Verified: `MTL_SHADER_VALIDATION=1 test-inkling-metal` **`454/454` PASS** (both `TENSOR=1` and `TENSOR=0`), Ashhart `quant-autopsy` **`15/23 = 100.0%` exact retention** vs `Lossless-F16` (`40.49` vs `31.17 tok/s`), `output-parity` `6/6` greedy bit-identical on spec/lookup/shortlist stack, and Songe `--lora` coexistence **PASS**.

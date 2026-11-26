@@ -10,8 +10,10 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <mutex>
 #include <numeric>
+#include <string>
 #include <vector>
 
 void llama_model_dflash::load_hparams_inkling2(llama_model_loader & ml) {
@@ -157,13 +159,17 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
         return nullptr;
     }
 
+    const char * sl_file_env = use_short ? std::getenv("LLAMA_INKLING_DSPARK_SHORTLIST_FILE") : nullptr;
+    const std::string shortlist_file = (sl_file_env && sl_file_env[0]) ? std::string(sl_file_env) : std::string();
+
     std::lock_guard<std::mutex> lock(dmodel.inkling_head_mtx);
     for (const auto & entry : dmodel.inkling_head_cache) {
         if (entry->target_output_data == target.output->data &&
                 entry->target_ne0 == target.output->ne[0] &&
                 entry->target_ne1 == target.output->ne[1] &&
                 entry->req_vocab == req_vocab &&
-                entry->w2_type == want_w2_type) {
+                entry->w2_type == want_w2_type &&
+                entry->shortlist_file == shortlist_file) {
             return entry;
         }
     }
@@ -179,30 +185,54 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     std::vector<int32_t> selected_ids;
     std::vector<float> bias_full;
     int64_t eff_vocab = req_vocab;
+    size_t from_file = 0;
     if (use_short) {
         bias_full.resize((size_t) n_vocab_full);
         ggml_backend_tensor_get(dmodel.dspark_markov_w2_b, bias_full.data(), 0, bias_full.size() * sizeof(float));
 
         selected_ids.reserve((size_t) req_vocab);
-        std::vector<int32_t> candidates;
-        candidates.reserve((size_t) n_vocab_full);
+        std::vector<uint8_t> seen((size_t) n_vocab_full, 0);
 
         for (int32_t id = 0; id < (int32_t) n_vocab_full; ++id) {
             if (id < 256 || dmodel.vocab.is_control(id) || dmodel.vocab.is_eog(id)) {
                 selected_ids.push_back(id);
-            } else {
-                candidates.push_back(id);
+                seen[(size_t) id] = 1;
             }
         }
-        if ((int64_t) selected_ids.size() < req_vocab && !candidates.empty()) {
-            const size_t need = std::min(candidates.size(), (size_t) req_vocab - selected_ids.size());
-            std::nth_element(candidates.begin(), candidates.begin() + need, candidates.end(),
-                    [&](int32_t a, int32_t b) {
-                        const float ba = bias_full[(size_t) a];
-                        const float bb = bias_full[(size_t) b];
-                        return ba != bb ? ba > bb : a < b;
-                    });
-            selected_ids.insert(selected_ids.end(), candidates.begin(), candidates.begin() + need);
+        if (!shortlist_file.empty() && (int64_t) selected_ids.size() < req_vocab) {
+            std::ifstream in(shortlist_file);
+            if (!in) {
+                LLAMA_LOG_WARN("%s: failed to open LLAMA_INKLING_DSPARK_SHORTLIST_FILE='%s', falling back to bias ranking\n",
+                        __func__, shortlist_file.c_str());
+            } else {
+                int64_t id = -1;
+                while ((int64_t) selected_ids.size() < req_vocab && (in >> id)) {
+                    if (id >= 0 && id < n_vocab_full && !seen[(size_t) id]) {
+                        selected_ids.push_back((int32_t) id);
+                        seen[(size_t) id] = 1;
+                        ++from_file;
+                    }
+                }
+            }
+        }
+        if ((int64_t) selected_ids.size() < req_vocab) {
+            std::vector<int32_t> candidates;
+            candidates.reserve((size_t) n_vocab_full);
+            for (int32_t id = 0; id < (int32_t) n_vocab_full; ++id) {
+                if (!seen[(size_t) id]) {
+                    candidates.push_back(id);
+                }
+            }
+            if (!candidates.empty()) {
+                const size_t need = std::min(candidates.size(), (size_t) req_vocab - selected_ids.size());
+                std::nth_element(candidates.begin(), candidates.begin() + need, candidates.end(),
+                        [&](int32_t a, int32_t b) {
+                            const float ba = bias_full[(size_t) a];
+                            const float bb = bias_full[(size_t) b];
+                            return ba != bb ? ba > bb : a < b;
+                        });
+                selected_ids.insert(selected_ids.end(), candidates.begin(), candidates.begin() + need);
+            }
         }
         std::sort(selected_ids.begin(), selected_ids.end());
         eff_vocab = (int64_t) selected_ids.size();
@@ -215,6 +245,7 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
     entry->req_vocab          = req_vocab;
     entry->eff_vocab          = eff_vocab;
     entry->w2_type            = want_w2_type;
+    entry->shortlist_file     = shortlist_file;
 
     const int n_tensors = use_short ? 4 : 1;
     ggml_init_params init_p = {
@@ -291,8 +322,8 @@ static std::shared_ptr<const llama_model_dflash::inkling_dspark_fast_head_entry>
         ggml_backend_tensor_set(entry->shortlist_ids, selected_ids.data(), 0, selected_ids.size() * sizeof(int32_t));
     }
 
-    LLAMA_LOG_INFO("%s: built immutable Inkling DSpark fast head (vocab=%lld/%lld, w2=%s, size=%.2f MiB, %.1f ms)\n",
-            __func__, (long long) eff_vocab, (long long) n_vocab_full,
+    LLAMA_LOG_INFO("%s: built immutable Inkling DSpark fast head (vocab=%lld/%lld, from_file=%zu, w2=%s, size=%.2f MiB, %.1f ms)\n",
+            __func__, (long long) eff_vocab, (long long) n_vocab_full, from_file,
             ggml_type_name(w2_type),
             ggml_backend_buffer_get_size(entry->buf.get()) / (1024.0 * 1024.0),
             (ggml_time_us() - t0) / 1000.0);
