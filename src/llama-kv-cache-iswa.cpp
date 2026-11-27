@@ -68,11 +68,26 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
         return  model.hparams.is_swa(il);
     };
 
-    const uint32_t size_base = kv_size;
+    uint32_t size_base = kv_size;
+    uint32_t base_swa_size = 0;
+    llama_swa_type base_swa_type = LLAMA_SWA_TYPE_NONE;
+
+    if (model.arch == LLM_ARCH_DFLASH) {
+        const char * dspark_win_env = std::getenv("LLAMA_INKLING_DSPARK_GLOBAL_WINDOW");
+        if (dspark_win_env && dspark_win_env[0]) {
+            const int32_t win = std::atoi(dspark_win_env);
+            if (win >= (int32_t) hparams.n_swa && (uint32_t) win < size_base) {
+                base_swa_size = (uint32_t) win;
+                base_swa_type = LLAMA_SWA_TYPE_STANDARD;
+                size_base = GGML_PAD(std::min(size_base, base_swa_size * (unified ? n_seq_max : 1) + n_ubatch), 256);
+                LLAMA_LOG_INFO("%s: DSpark global KV windowed to %u tokens (%u cells)\n", __func__, base_swa_size, size_base);
+            }
+        }
+    }
 
     // note: the SWA cache is always padded to 256 for performance
     //       https://github.com/ggml-org/llama.cpp/issues/17037
-    uint32_t size_swa = GGML_PAD(std::min(size_base, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
+    uint32_t size_swa = GGML_PAD(std::min(kv_size, hparams.n_swa*(unified ? n_seq_max : 1) + n_ubatch), 256);
 
     // when using full-size SWA cache, we set the SWA cache size to be equal to the base cache size
     if (swa_full) {
@@ -97,7 +112,7 @@ llama_kv_cache_iswa::llama_kv_cache_iswa(
     kv_base = std::make_unique<llama_kv_cache>(
             model, no_alloc, hparams, type_k, type_v,
             v_trans, offload, unified, size_base, n_seq_max,
-            0, LLAMA_SWA_TYPE_NONE, mem_other_base, filter_base, reuse, share);
+            base_swa_size, base_swa_type, mem_other_base, filter_base, reuse, share);
 
     const char * swa_f16_env = std::getenv("LLAMA_INKLING_SWA_KV_F16");
     const bool force_swa_f16 = swa_f16_env && std::strcmp(swa_f16_env, "1") == 0;

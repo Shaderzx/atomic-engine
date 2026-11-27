@@ -140,3 +140,23 @@ Grounded in 9.5 hours of live Songe telemetry (`865` real `pi` exchanges, `880,5
      - `255K` (`254,920` tokens, `3/3` needles): `9.40 -> 13.32 tok/s` (**`+41.7%`**, `32.1 GiB` peak RSS)
      - Real-workload weighted average across Shad's 865-exchange distribution: **`22.39 -> 33.74 tok/s` (`+50.7%`)**.
    - Verified: `MTL_SHADER_VALIDATION=1 test-inkling-metal` **`454/454` PASS** (both `TENSOR=1` and `TENSOR=0`), Ashhart `quant-autopsy` **`15/23 = 100.0%` exact retention** vs `Lossless-F16` (`40.49` vs `31.17 tok/s`), `output-parity` `6/6` greedy bit-identical on spec/lookup/shortlist stack, and Songe `--lora` coexistence **PASS**.
+
+
+## Wave E7 — High-Context (`128K–256K`) Decode Overclock (2026-11-27, `powermode = 2` High Power)
+- **Implemented & Shader-Validated (`MTL_SHADER_VALIDATION=1` `580/580` `TENSOR=1`, `550/550` `TENSOR=0`):**
+  1. **EXP-9 (`C = 32` High-Occupancy Quantized Global KV Decode):** Added `C = 32` tile specialization (`15.8 KB` smem -> 2 TGs/core vs `27.6 KB` 1 TG/core) to `kernel_inkling_fa_decode_tensor_impl`, speeding dense `256K` `Q4_0/Q4_0` 8-layer global attention from `22.10 -> 19.75 ms` (`1.79×` faster than `35.41 ms` F16). Tested with `LLAMA_INKLING_SWA_KV_F16=1`, hitting `89.53 tok/s` (`102K`) / `64.41 tok/s` (`255K`) @ `20.6 GiB` RSS, but **rejected for default deployment** by Ashhart `quant-autopsy` (`93.7%` retention, `code_logic` `50% -> 25%`, `-36%` prefill at `214K`). Retained as opt-in for tight-RAM environments.
+  2. **EXP-10 (`Q = 24` Exact `8×3` Tensor Decode + `LLAMA_INKLING_CTX_NMAX` + `LLAMA_INKLING_DSPARK_GLOBAL_WINDOW`):**
+     - `Q = 24, C = 64` (`16.3 KB` smem -> 2 TGs/core vs `Q = 32` `21.5 KB` 1 TG/core) cut `F16/F16` `n_q = 8` `256K` attention `-13.2%` (`43.26 -> 37.54 ms`), lifting 100%-lossless dense `255K` warm decode `+16.3%` (`32.76 -> 38.11 tok/s`).
+     - `LLAMA_INKLING_DSPARK_GLOBAL_WINDOW=65536` with `-ctkd f16 -ctvd f16` preserves 100% full `0K–64K` DSpark draft quality while bounding DSpark's `blk.1` global KV ring at `102K–255K`.
+  3. **EXP-11 (Quest-Style Exact-Upper-Bound Sparse Page-Skip Global FA, `GGML_METAL_INKLING_FA_SPARSE_PAGES=256`):**
+     - Self-invalidating per-64-key page `(k_min[128], k_max[128])` envelope (`page_update` guarded by `epoch + sig(k_pos[64]) + 64B kcheck + frontier_overlap`), parallel `page_score` (exact upper bound `max_{qi,g}(sum_d max(q*k_min, q*k_max) - sink)` with forced `4` sink pages + `32` local pages), 2-pass 256-bin radix `page_topk`, and `decode_tensor_sparse` (active only for `n_swa == 0 && n_kv >= 49152`; toggleable to `0` for 100% dense).
+     - Cut `256K` 8-layer `F16/F16` global FA **`4.63×` (`35.41 -> 7.65 ms`)**.
+- **Wave E7 Champion (`E7_F16_Q256`, `powermode = 2`, AC Power, thermal `100 -> 100`):**
+  - Config: `F16/F16` KV + `F16/F16` DSpark + `--spec-draft-n-max 4` + `LLAMA_INKLING_DSPARK_GLOBAL_WINDOW=65536` + `GGML_METAL_INKLING_FA_SPARSE_PAGES=256` (all Wave E6 flags retained).
+  - **`coding 10/10`:** `92.32 tok/s` (`ref 98.19`, `10/10 PASS`) vs `93.26` E6 baseline (`0K–48K` stays 100% dense `F16/F16`).
+  - **`pi_32k` (`37K–50K`):** **`81.40 tok/s`** (`pp 1061.0`) vs `81.04` (`pp 1047.2`).
+  - **`pi_102k` (`102K–110K`):** **`80.92 tok/s`** (**`+20.8%`**, `pp 837.3`, peaking `86.28`) vs `67.01` (`pp 800.1`).
+  - **`pi_214k` (`238K–244K`):** **`70.34 tok/s`** (**`+88.6%` = `1.89×`**, `turns=[69.46, 71.25]`, `ml=4.00`) vs `37.30` (`ml=2.77`).
+  - **`181K` (`181K` tok × 3 seeds):** **`9/9` needles PASS**, **`60.67–65.22 tok/s`** warm decode (`med 61.50`, `ttft 1.2s`).
+  - **`255K` (`255K` tok × 3 seeds):** **`9/9` needles PASS (`18/18` total!)**, **`53.50–58.08 tok/s`** warm decode (**`med 55.67 = +70.0%`**, peak **`+77.3%`** vs `32.76` E6 baseline), `25.26–32.49 GiB` peak RSS.
+  - **Ashhart `quant-autopsy`:** **`17/23 = 100.0%` retention** (`tool=100%`, `json=100%`, `code=50%`, `0%` sycophancy flip, `94.9 tok/s`, **`LOSSLESS_TIER / PARETO`**) + Songe `--lora` coexistence **PASS**.

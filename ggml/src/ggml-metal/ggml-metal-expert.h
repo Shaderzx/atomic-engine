@@ -39,19 +39,28 @@ enum { GGML_METAL_INKLING_FA_SPLIT_MAX_NWG = 128 };
 // Depth-attention mix max input states: GGML_MAX_SRC (10) - 2 = 8 states (+ 1 query = 9 < GGML_MAX_SRC).
 enum { GGML_METAL_INKLING_MIX_MAX_STATES   = 8   };
 
-static inline size_t ggml_metal_inkling_fa_tensor_smem(uint32_t q_tile, bool has_skv) {
-    // Matches fa_tensor.metal layout: sq[Q*128 half] + ss[Q*64 float] + sp[Q*64 half] +
-    // sr[Q float] + sf[4 int] + kpos_tg[64 int] + kseq_tg[64 uint64] + optional skv[64*128 half].
-    const size_t bytes =
-        (size_t) q_tile * 128u * 2u +
-        (size_t) q_tile *  64u * 4u +
-        (size_t) q_tile *  64u * 2u +
-        (size_t) q_tile *        4u +
-        4u  * 4u +
-        64u * 4u +
-        64u * 8u +
-        (has_skv ? (size_t) 64u * 128u * 2u : 0u);
+static inline size_t ggml_metal_inkling_fa_decode_tensor_smem(uint32_t q_tile, uint32_t c_tile, bool has_skv) {
+    // Matches fa_tensor.metal layout: sq[Q*128 half] + ss[Q*C float] + sp[Q*C half] +
+    // sr[Q float] + sf[4 int] + kpos_tg[C int] + kseq_tg[C uint64] + optional skv[C*128 half].
+    // Epilogue reuses shmem for so[Q*128 float] + sm_out[Q float] + ss_out[Q float].
+    const size_t loop_bytes =
+        (size_t) q_tile * 128u   * 2u +
+        (size_t) q_tile * c_tile * 4u +
+        (size_t) q_tile * c_tile * 2u +
+        (size_t) q_tile *          4u +
+        4u * 4u +
+        (size_t) c_tile * 4u +
+        (size_t) c_tile * 8u +
+        (has_skv ? (size_t) c_tile * 128u * 2u : 0u);
+    const size_t epilogue_bytes =
+        (size_t) q_tile * 128u * 4u +
+        (size_t) q_tile * 2u   * 4u;
+    const size_t bytes = loop_bytes > epilogue_bytes ? loop_bytes : epilogue_bytes;
     return (bytes + 255u) & ~(size_t) 255u;
+}
+
+static inline size_t ggml_metal_inkling_fa_tensor_smem(uint32_t q_tile, bool has_skv) {
+    return ggml_metal_inkling_fa_decode_tensor_smem(q_tile, 64u, has_skv);
 }
 
 static inline bool ggml_metal_is_host_expert(const struct ggml_tensor * node) {

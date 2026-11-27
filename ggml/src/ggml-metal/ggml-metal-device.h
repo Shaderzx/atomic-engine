@@ -383,6 +383,26 @@ void   ggml_metal_buffer_clear        (ggml_metal_buffer_t buf, uint8_t value);
 //
 struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, const struct ggml_tensor * t);
 
+// Per-K-buffer cached page summaries and workspace for Inkling2 Quest-style sparse global FA.
+struct ggml_metal_inkling_sparse_bufs {
+    struct ggml_metal_buffer_id page_minmax;  // [n_pages, 8, 2, 128] half
+    struct ggml_metal_buffer_id page_meta;    // [n_pages] 48 B metadata/signatures
+    struct ggml_metal_buffer_id page_scores;  // [8, n_pages] float
+    struct ggml_metal_buffer_id active_pages; // [8, n_pages] uint32_t
+    struct ggml_metal_buffer_id active_count; // [8] uint32_t
+    uint32_t epoch;
+};
+
+bool ggml_metal_device_get_inkling_fa_sparse(
+        ggml_metal_device_t dev,
+        struct ggml_metal_buffer_id k_buf,
+        uint32_t n_pages,
+        struct ggml_metal_inkling_sparse_bufs * out);
+
+void ggml_metal_device_bump_inkling_fa_sparse_epoch(
+        ggml_metal_device_t dev,
+        struct ggml_metal_buffer_id k_buf);
+
 #ifdef __cplusplus
 }
 #endif

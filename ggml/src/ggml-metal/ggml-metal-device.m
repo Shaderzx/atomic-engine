@@ -915,6 +915,45 @@ void ggml_metal_encoder_end_encoding(ggml_metal_encoder_t encoder) {
     [encoder->obj endEncoding];
 }
 
+struct ggml_metal_inkling_sparse_entry {
+    void *   k_metal;
+    size_t   k_offs;
+    uint32_t n_pages;
+    uint32_t epoch;
+    uint64_t lru;
+    ggml_metal_buffer_t buf;
+    size_t   off_meta;
+    size_t   off_scores;
+    size_t   off_pages;
+    size_t   off_count;
+};
+
+#define GGML_METAL_INKLING_SPARSE_MAX_ENTRIES 64
+
+struct ggml_metal_inkling_sparse_cache {
+    NSLock * lock;
+    uint64_t tick;
+    int      count;
+    struct ggml_metal_inkling_sparse_entry entries[GGML_METAL_INKLING_SPARSE_MAX_ENTRIES];
+};
+
+static void ggml_metal_inkling_sparse_cache_free(struct ggml_metal_inkling_sparse_cache * cache) {
+    if (!cache) {
+        return;
+    }
+    [cache->lock lock];
+    for (int i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].buf) {
+            ggml_metal_buffer_free(cache->entries[i].buf);
+            cache->entries[i].buf = NULL;
+        }
+    }
+    cache->count = 0;
+    [cache->lock unlock];
+    [cache->lock release];
+    free(cache);
+}
+
 struct ggml_metal_device {
     id<MTLDevice> mtl_device;
 
@@ -931,6 +970,9 @@ struct ggml_metal_device {
 
     // shared fusion debugging context
     struct ggml_metal_fusion_info * finfo;
+
+    // per-K-buffer page summary cache for Inkling2 Quest-style sparse global FA
+    struct ggml_metal_inkling_sparse_cache * inkling_sparse;
 
     // virtual address for GPU memory allocations
     atomic_uintptr_t addr_virt;
@@ -1335,6 +1377,9 @@ ggml_metal_device_t ggml_metal_device_init(int device, int n_devices) {
                     dev->rsets = nil;
                 }
 
+                dev->inkling_sparse = calloc(1, sizeof(struct ggml_metal_inkling_sparse_cache));
+                dev->inkling_sparse->lock = [[NSLock alloc] init];
+
                 // print MTL GPU family:
                 GGML_LOG_INFO("%s: GPU name:   %s (%s)\n", __func__, dev->props.name, dev->props.desc);
 
@@ -1391,6 +1436,9 @@ void ggml_metal_device_free(ggml_metal_device_t dev) {
     assert(dev != NULL);
 
     @autoreleasepool {
+        ggml_metal_inkling_sparse_cache_free(dev->inkling_sparse);
+        dev->inkling_sparse = NULL;
+
         ggml_metal_fusion_info_free(dev->finfo);
 
         ggml_metal_rsets_free(dev->rsets);
@@ -3034,3 +3082,112 @@ struct ggml_metal_buffer_id ggml_metal_buffer_get_id(ggml_metal_buffer_t buf, co
 void ggml_metal_encoder_publish_routes(ggml_metal_encoder_t, struct ggml_metal_buffer_id, void *,
         void (*)(void *, uint64_t, uint64_t, size_t), void *, uint64_t, size_t);
 #include "ggml-metal-route-publication.m.inc"
+
+static size_t ggml_metal_pad256(size_t n) {
+    return (n + 255u) & ~(size_t) 255u;
+}
+
+bool ggml_metal_device_get_inkling_fa_sparse(
+        ggml_metal_device_t dev,
+        struct ggml_metal_buffer_id k_buf,
+        uint32_t n_pages,
+        struct ggml_metal_inkling_sparse_bufs * out) {
+    if (!dev || !dev->inkling_sparse || !k_buf.metal || n_pages == 0 || !out) {
+        return false;
+    }
+
+    struct ggml_metal_inkling_sparse_cache * cache = dev->inkling_sparse;
+    [cache->lock lock];
+
+    cache->tick += 1;
+    int idx = -1;
+    for (int i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].k_metal == k_buf.metal && cache->entries[i].k_offs == k_buf.offs) {
+            idx = i;
+            break;
+        }
+    }
+
+    const size_t sz_minmax = ggml_metal_pad256((size_t) n_pages * 8u * 2u * 128u * sizeof(uint16_t));
+    const size_t sz_meta   = ggml_metal_pad256((size_t) n_pages * 48u);
+    const size_t sz_scores = ggml_metal_pad256((size_t) n_pages * 8u * sizeof(float));
+    const size_t sz_pages  = ggml_metal_pad256((size_t) n_pages * 8u * sizeof(uint32_t));
+    const size_t sz_count  = ggml_metal_pad256(8u * sizeof(uint32_t));
+    const size_t total_sz  = sz_minmax + sz_meta + sz_scores + sz_pages + sz_count;
+
+    if (idx < 0 || cache->entries[idx].n_pages < n_pages || cache->entries[idx].buf == NULL) {
+        ggml_metal_buffer_t new_buf = ggml_metal_buffer_init(dev, total_sz, false);
+        if (!new_buf) {
+            [cache->lock unlock];
+            return false;
+        }
+        if (idx < 0) {
+            if (cache->count < GGML_METAL_INKLING_SPARSE_MAX_ENTRIES) {
+                idx = cache->count++;
+            } else {
+                // Evict least-recently-used entry
+                int lru_i = 0;
+                for (int i = 1; i < cache->count; ++i) {
+                    if (cache->entries[i].lru < cache->entries[lru_i].lru) {
+                        lru_i = i;
+                    }
+                }
+                if (cache->entries[lru_i].buf) {
+                    ggml_metal_buffer_free(cache->entries[lru_i].buf);
+                }
+                idx = lru_i;
+            }
+            cache->entries[idx].epoch = 1u;
+        } else {
+            if (cache->entries[idx].buf) {
+                ggml_metal_buffer_free(cache->entries[idx].buf);
+            }
+            cache->entries[idx].epoch += 1u;
+            if (cache->entries[idx].epoch == 0u) {
+                cache->entries[idx].epoch = 1u;
+            }
+        }
+        cache->entries[idx].k_metal    = k_buf.metal;
+        cache->entries[idx].k_offs     = k_buf.offs;
+        cache->entries[idx].n_pages    = n_pages;
+        cache->entries[idx].buf        = new_buf;
+        cache->entries[idx].off_meta   = sz_minmax;
+        cache->entries[idx].off_scores = sz_minmax + sz_meta;
+        cache->entries[idx].off_pages  = sz_minmax + sz_meta + sz_scores;
+        cache->entries[idx].off_count  = sz_minmax + sz_meta + sz_scores + sz_pages;
+    }
+
+    struct ggml_metal_inkling_sparse_entry * e = &cache->entries[idx];
+    e->lru = cache->tick;
+
+    void * mtl = (__bridge void *) e->buf->buffers[0].metal;
+    out->page_minmax  = (struct ggml_metal_buffer_id){ mtl, 0u };
+    out->page_meta    = (struct ggml_metal_buffer_id){ mtl, e->off_meta };
+    out->page_scores  = (struct ggml_metal_buffer_id){ mtl, e->off_scores };
+    out->active_pages = (struct ggml_metal_buffer_id){ mtl, e->off_pages };
+    out->active_count = (struct ggml_metal_buffer_id){ mtl, e->off_count };
+    out->epoch        = e->epoch;
+
+    [cache->lock unlock];
+    return true;
+}
+
+void ggml_metal_device_bump_inkling_fa_sparse_epoch(
+        ggml_metal_device_t dev,
+        struct ggml_metal_buffer_id k_buf) {
+    if (!dev || !dev->inkling_sparse || !k_buf.metal) {
+        return;
+    }
+    struct ggml_metal_inkling_sparse_cache * cache = dev->inkling_sparse;
+    [cache->lock lock];
+    for (int i = 0; i < cache->count; ++i) {
+        if (cache->entries[i].k_metal == k_buf.metal && cache->entries[i].k_offs == k_buf.offs) {
+            cache->entries[i].epoch += 1u;
+            if (cache->entries[i].epoch == 0u) {
+                cache->entries[i].epoch = 1u;
+            }
+            break;
+        }
+    }
+    [cache->lock unlock];
+}

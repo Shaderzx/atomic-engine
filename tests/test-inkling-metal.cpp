@@ -739,6 +739,240 @@ int main(int argc, char ** argv) {
         }
     });
 
+    t.test("inkling_flash_attn_v2 Wave E7: C=32 mixed KV, Q=24 exact 8x3, and Quest sparse page-skip + self-invalidation", [&](testing & t) {
+        auto create_gated = reinterpret_cast<fa_gated_create_fn>(
+                ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_flash_attn_v2"));
+        t.assert_true(create_gated != nullptr);
+
+        // 1. Dense C=32 quantized / mixed KV & Q=24 (n_q=6,8) + Q=32 (n_q=10) parity
+        unsetenv("GGML_METAL_INKLING_FA_SPARSE_PAGES");
+        const std::vector<std::pair<ggml_type, ggml_type>> kv_combos = {
+            { GGML_TYPE_F16,  GGML_TYPE_F16  },
+            { GGML_TYPE_F16,  GGML_TYPE_Q4_0 },
+            { GGML_TYPE_Q8_0, GGML_TYPE_Q4_0 },
+            { GGML_TYPE_Q4_0, GGML_TYPE_Q4_0 },
+            { GGML_TYPE_F16,  GGML_TYPE_Q8_0 },
+            { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
+        };
+        for (auto [kt, vt] : kv_combos) {
+            for (int64_t n_q : {5, 6, 8, 10}) {
+                const int64_t n_kv = 1024;
+                const int32_t extent = 64;
+                const int32_t n_swa = 0;
+                const float scale = 1.0f / std::sqrt(128.0f);
+                auto q_v   = rand_vec(128 * 24 * n_q, 7101 + (uint32_t)n_q, -0.5f, 0.5f);
+                auto k_raw = rand_vec(128 * 8 * n_kv, 7102, -0.5f, 0.5f);
+                auto v_raw = rand_vec(128 * 8 * n_kv, 7103, -0.5f, 0.5f);
+                auto tbl_v = rand_vec(extent * 24 * n_q, 7104, -0.5f, 0.5f);
+                auto snk_v = rand_vec(24 * n_q, 7105, -0.5f, 0.5f);
+
+                std::vector<int32_t> q_pos(2 * n_q);
+                for (int64_t i = 0; i < n_q; ++i) {
+                    q_pos[2 * i + 0] = (int32_t) (n_kv - n_q + i);
+                    q_pos[2 * i + 1] = 0;
+                }
+                std::vector<int32_t> k_pos(3 * n_kv);
+                for (int64_t i = 0; i < n_kv; ++i) {
+                    k_pos[3 * i + 0] = (int32_t) i;
+                    k_pos[3 * i + 1] = 1;
+                    k_pos[3 * i + 2] = 0;
+                }
+
+                std::vector<uint8_t> k_bytes, v_bytes;
+                std::vector<float> k_ref, v_ref;
+                quantize_and_dequant(kt, k_raw, 8 * n_kv, 128, k_bytes, k_ref);
+                quantize_and_dequant(vt, v_raw, 8 * n_kv, 128, v_bytes, v_ref);
+
+                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                auto * tq   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, n_q);
+                auto * tk   = ggml_new_tensor_3d(ctx.get(), kt, 128, 8, n_kv);
+                auto * tv   = ggml_new_tensor_3d(ctx.get(), vt, 128, 8, n_kv);
+                auto * ttbl = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, extent, 24, n_q);
+                auto * tsnk = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, n_q);
+                auto * tqp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_q);
+                auto * tkp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, n_kv);
+                auto * out  = create_gated(ctx.get(), tq, tk, tv, ttbl, tsnk, tqp, tkp, nullptr, scale, extent, n_swa);
+                t.assert_true(out != nullptr && ggml_backend_supports_op(backend, out));
+
+                std::vector<float> got(3072 * n_q);
+                run_graph(ctx.get(), out, {
+                    {tq,   {q_v.data(),     q_v.size() * sizeof(float)}},
+                    {tk,   {k_bytes.data(), k_bytes.size()}},
+                    {tv,   {v_bytes.data(), v_bytes.size()}},
+                    {ttbl, {tbl_v.data(),   tbl_v.size() * sizeof(float)}},
+                    {tsnk, {snk_v.data(),   snk_v.size() * sizeof(float)}},
+                    {tqp,  {q_pos.data(),   q_pos.size() * sizeof(int32_t)}},
+                    {tkp,  {k_pos.data(),   k_pos.size() * sizeof(int32_t)}},
+                }, got.data(), got.size() * sizeof(float));
+
+                auto ref = cpu_ref_inkling_fa(q_v, k_ref, v_ref, tbl_v, snk_v, q_pos, k_pos, n_q, n_kv, extent, n_swa, scale);
+                const float tol = (kt == GGML_TYPE_F16 && vt == GGML_TYPE_F16) ? 2e-3f : 5e-3f;
+                t.assert_true(max_abs_diff(got, ref) < tol);
+            }
+        }
+
+        // 2. Quest Sparse exact dense parity when K_PAGES >= n_pages (F16/F16, F16/Q4_0, Q4_0/Q4_0)
+        setenv("GGML_METAL_INKLING_FA_SPARSE_MIN_KV", "0", 1);
+        setenv("GGML_METAL_INKLING_FA_SPARSE_PAGES", "32", 1);
+        setenv("GGML_METAL_INKLING_FA_SPARSE_SINK", "64", 1);
+        setenv("GGML_METAL_INKLING_FA_SPARSE_LOCAL", "128", 1);
+        for (auto [kt, vt] : std::vector<std::pair<ggml_type, ggml_type>>{
+                {GGML_TYPE_F16, GGML_TYPE_F16}, {GGML_TYPE_F16, GGML_TYPE_Q4_0}, {GGML_TYPE_Q4_0, GGML_TYPE_Q4_0}}) {
+            for (int64_t n_q : {5, 8}) {
+                const int64_t n_kv = 2048; // 32 pages == K_PAGES
+                const int32_t extent = 64;
+                const float scale = 1.0f / std::sqrt(128.0f);
+                auto q_v   = rand_vec(128 * 24 * n_q, 7201 + (uint32_t)n_q, -0.5f, 0.5f);
+                auto k_raw = rand_vec(128 * 8 * n_kv, 7202, -0.5f, 0.5f);
+                auto v_raw = rand_vec(128 * 8 * n_kv, 7203, -0.5f, 0.5f);
+                auto tbl_v = rand_vec(extent * 24 * n_q, 7204, -0.5f, 0.5f);
+                auto snk_v = rand_vec(24 * n_q, 7205, -0.5f, 0.5f);
+
+                std::vector<int32_t> q_pos(2 * n_q);
+                for (int64_t i = 0; i < n_q; ++i) { q_pos[2 * i] = (int32_t)(n_kv - n_q + i); q_pos[2 * i + 1] = 0; }
+                std::vector<int32_t> k_pos(3 * n_kv);
+                for (int64_t i = 0; i < n_kv; ++i) { k_pos[3 * i] = (int32_t)i; k_pos[3 * i + 1] = 1; k_pos[3 * i + 2] = 0; }
+
+                std::vector<uint8_t> k_bytes, v_bytes;
+                std::vector<float> k_ref, v_ref;
+                quantize_and_dequant(kt, k_raw, 8 * n_kv, 128, k_bytes, k_ref);
+                quantize_and_dequant(vt, v_raw, 8 * n_kv, 128, v_bytes, v_ref);
+
+                ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+                auto * tq   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, n_q);
+                auto * tk   = ggml_new_tensor_3d(ctx.get(), kt, 128, 8, n_kv);
+                auto * tv   = ggml_new_tensor_3d(ctx.get(), vt, 128, 8, n_kv);
+                auto * ttbl = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, extent, 24, n_q);
+                auto * tsnk = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, n_q);
+                auto * tqp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_q);
+                auto * tkp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, n_kv);
+                auto * out  = create_gated(ctx.get(), tq, tk, tv, ttbl, tsnk, tqp, tkp, nullptr, scale, extent, 0);
+                t.assert_true(out != nullptr);
+
+                std::vector<float> got(3072 * n_q);
+                run_graph(ctx.get(), out, {
+                    {tq,   {q_v.data(),     q_v.size() * sizeof(float)}},
+                    {tk,   {k_bytes.data(), k_bytes.size()}},
+                    {tv,   {v_bytes.data(), v_bytes.size()}},
+                    {ttbl, {tbl_v.data(),   tbl_v.size() * sizeof(float)}},
+                    {tsnk, {snk_v.data(),   snk_v.size() * sizeof(float)}},
+                    {tqp,  {q_pos.data(),   q_pos.size() * sizeof(int32_t)}},
+                    {tkp,  {k_pos.data(),   k_pos.size() * sizeof(int32_t)}},
+                }, got.data(), got.size() * sizeof(float));
+
+                auto ref = cpu_ref_inkling_fa(q_v, k_ref, v_ref, tbl_v, snk_v, q_pos, k_pos, n_q, n_kv, extent, 0, scale);
+                const float tol = (kt == GGML_TYPE_F16 && vt == GGML_TYPE_F16) ? 2e-3f : 5e-3f;
+                t.assert_true(max_abs_diff(got, ref) < tol);
+            }
+        }
+
+        // 3. Quest Sparse needle retrieval (8/64 pages = 87.5% skip) + in-place K buffer mutation self-invalidation!
+        setenv("GGML_METAL_INKLING_FA_SPARSE_PAGES", "8", 1);
+        {
+            const int64_t n_q = 5, n_kv = 4096; // 64 pages, select top 8
+            const int32_t extent = 64;
+            const float scale = 1.0f / std::sqrt(128.0f);
+            auto q_v   = rand_vec(128 * 24 * n_q, 7301, -0.3f, 0.3f);
+            auto k_raw = rand_vec(128 * 8 * n_kv, 7302, -0.15f, 0.15f);
+            auto v_raw = rand_vec(128 * 8 * n_kv, 7303, -0.1f, 0.1f);
+            auto tbl_v = rand_vec(extent * 24 * n_q, 7304, -0.1f, 0.1f);
+            std::vector<float> snk_v(24 * n_q, 0.0f);
+
+            std::vector<int32_t> q_pos(2 * n_q);
+            for (int64_t i = 0; i < n_q; ++i) { q_pos[2 * i] = (int32_t)(n_kv - n_q + i); q_pos[2 * i + 1] = 0; }
+            std::vector<int32_t> k_pos(3 * n_kv);
+            for (int64_t i = 0; i < n_kv; ++i) { k_pos[3 * i] = (int32_t)i; k_pos[3 * i + 1] = 1; k_pos[3 * i + 2] = 0; }
+
+            // Allocate persistent graph once so step 2 overwrites the EXACT same K Metal buffer at the same k_pos!
+            ggml_context_ptr ctx(ggml_init({2 * 1024 * 1024, nullptr, true}));
+            auto * tq   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, 128, 24, n_q);
+            auto * tk   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, 128, 8, n_kv);
+            auto * tv   = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F16, 128, 8, n_kv);
+            auto * ttbl = ggml_new_tensor_3d(ctx.get(), GGML_TYPE_F32, extent, 24, n_q);
+            auto * tsnk = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_F32, 24, n_q);
+            auto * tqp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 2, n_q);
+            auto * tkp  = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 3, n_kv);
+            auto * out  = create_gated(ctx.get(), tq, tk, tv, ttbl, tsnk, tqp, tkp, nullptr, scale, extent, 0);
+            ggml_cgraph * gf = ggml_new_graph(ctx.get());
+            ggml_build_forward_expand(gf, out);
+            ggml_gallocr_t allocr = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            t.assert_true(ggml_gallocr_alloc_graph(allocr, gf));
+
+            // Step A: Plant strong needle at page 17 (pos 1117, outside sink [0..63] and local [3968..4095])
+            // Using k=+-12 gives dot*scale ~20.4 (exp(20.4) ~ 7e8 >> 3584 skipped background keys).
+            auto k1 = k_raw, v1 = v_raw;
+            const int64_t needle1 = 17 * 64 + 29;
+            for (int64_t h = 0; h < 8; ++h) {
+                for (int64_t d = 0; d < 128; ++d) {
+                    const float qd = q_v[((0 * 24 + h * 3) * 128) + d];
+                    k1[((needle1 * 8 + h) * 128) + d] = qd >= 0.0f ? 12.0f : -12.0f;
+                    v1[((needle1 * 8 + h) * 128) + d] = (d & 1) ? -5.0f : 5.0f;
+                }
+            }
+            std::vector<uint8_t> k1_b, v1_b;
+            std::vector<float> k1_r, v1_r;
+            quantize_and_dequant(GGML_TYPE_F16, k1, 8 * n_kv, 128, k1_b, k1_r);
+            quantize_and_dequant(GGML_TYPE_F16, v1, 8 * n_kv, 128, v1_b, v1_r);
+
+            ggml_backend_tensor_set(tq,   q_v.data(),   0, q_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tk,   k1_b.data(),  0, k1_b.size());
+            ggml_backend_tensor_set(tv,   v1_b.data(),  0, v1_b.size());
+            ggml_backend_tensor_set(ttbl, tbl_v.data(), 0, tbl_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tsnk, snk_v.data(), 0, snk_v.size() * sizeof(float));
+            ggml_backend_tensor_set(tqp,  q_pos.data(), 0, q_pos.size() * sizeof(int32_t));
+            ggml_backend_tensor_set(tkp,  k_pos.data(), 0, k_pos.size() * sizeof(int32_t));
+            t.assert_true(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+            std::vector<float> got1(3072 * n_q);
+            ggml_backend_tensor_get(out, got1.data(), 0, got1.size() * sizeof(float));
+            auto ref1 = cpu_ref_inkling_fa(q_v, k1_r, v1_r, tbl_v, snk_v, q_pos, k_pos, n_q, n_kv, extent, 0, scale);
+            // Check needle heads (q=0, head = h*3) match exact dense needle output within 1e-2!
+            float max_n1 = 0.0f;
+            for (int64_t h = 0; h < 8; ++h) {
+                for (int64_t d = 0; d < 128; ++d) {
+                    const size_t idx = (size_t)((h * 3) * 128 + d);
+                    max_n1 = std::max(max_n1, std::fabs(got1[idx] - ref1[idx]));
+                }
+            }
+            t.assert_true(max_n1 < 1e-2f);
+
+            // Step B: Overwrite K in-place at identical k_pos! Move needle to page 29 row 0 (triggers kcheck!), flip V sign!
+            auto k2 = k_raw, v2 = v_raw;
+            const int64_t needle2 = 29 * 64 + 0;
+            for (int64_t h = 0; h < 8; ++h) {
+                for (int64_t d = 0; d < 128; ++d) {
+                    const float qd = q_v[((0 * 24 + h * 3) * 128) + d];
+                    k2[((needle2 * 8 + h) * 128) + d] = qd >= 0.0f ? 12.0f : -12.0f;
+                    v2[((needle2 * 8 + h) * 128) + d] = (d & 1) ? 5.0f : -5.0f;
+                }
+            }
+            std::vector<uint8_t> k2_b, v2_b;
+            std::vector<float> k2_r, v2_r;
+            quantize_and_dequant(GGML_TYPE_F16, k2, 8 * n_kv, 128, k2_b, k2_r);
+            quantize_and_dequant(GGML_TYPE_F16, v2, 8 * n_kv, 128, v2_b, v2_r);
+            ggml_backend_tensor_set(tk, k2_b.data(), 0, k2_b.size());
+            ggml_backend_tensor_set(tv, v2_b.data(), 0, v2_b.size());
+            t.assert_true(ggml_backend_graph_compute(backend, gf) == GGML_STATUS_SUCCESS);
+
+            std::vector<float> got2(3072 * n_q);
+            ggml_backend_tensor_get(out, got2.data(), 0, got2.size() * sizeof(float));
+            auto ref2 = cpu_ref_inkling_fa(q_v, k2_r, v2_r, tbl_v, snk_v, q_pos, k_pos, n_q, n_kv, extent, 0, scale);
+            float max_n2 = 0.0f;
+            for (int64_t h = 0; h < 8; ++h) {
+                for (int64_t d = 0; d < 128; ++d) {
+                    const size_t idx = (size_t)((h * 3) * 128 + d);
+                    max_n2 = std::max(max_n2, std::fabs(got2[idx] - ref2[idx]));
+                }
+            }
+            t.assert_true(max_n2 < 1e-2f);
+            ggml_gallocr_free(allocr);
+        }
+        unsetenv("GGML_METAL_INKLING_FA_SPARSE_PAGES");
+        unsetenv("GGML_METAL_INKLING_FA_SPARSE_MIN_KV");
+        unsetenv("GGML_METAL_INKLING_FA_SPARSE_SINK");
+        unsetenv("GGML_METAL_INKLING_FA_SPARSE_LOCAL");
+    });
+
     t.test("inkling_mix_norm_v1 parity (n_q=1 and n_q=3, n_embd=3072)", [&](testing & t) {
         auto create = reinterpret_cast<mix_norm_create_fn>(
                 ggml_backend_reg_get_proc_address(reg, "ggml_backend_metal_inkling_mix_norm_v1"));

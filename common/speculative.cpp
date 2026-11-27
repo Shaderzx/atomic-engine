@@ -1698,10 +1698,26 @@ public:
                 }
                 context = context_embd.data() + slot * (size_t) n_embd_dec;
             }
+            // Optional context-gated draft cap (LLAMA_INKLING_CTX_NMAX=1 or "<short_nmax>:<pos_thresh>"):
+            // caps DSpark drafts below pos_thresh (default 4 below 64K) for zero short-ctx overhead,
+            // unlocking full params.n_max (e.g. 7 -> n_q=8 single-pass Q=24) at high context.
+            static const std::pair<int32_t, int32_t> ctx_nmax_cfg = []() -> std::pair<int32_t, int32_t> {
+                const char * v = std::getenv("LLAMA_INKLING_CTX_NMAX");
+                if (!v || !v[0] || std::strcmp(v, "0") == 0) { return { 0, 0 }; }
+                if (std::strcmp(v, "1") == 0) { return { 4, 65536 }; }
+                int32_t sn = 4, th = 65536;
+                if (std::sscanf(v, "%d:%d", &sn, &th) >= 1) {
+                    return { std::max(1, sn), std::max(0, th) };
+                }
+                return { 4, 65536 };
+            }();
+            const int32_t eff_n_max = (ctx_nmax_cfg.first > 0 && has_rnn_context && n_seq == 1 && dp.pos0 < ctx_nmax_cfg.second)
+                    ? std::min(params.n_max, ctx_nmax_cfg.first)
+                    : params.n_max;
             i_block_beg[seq_id] = batch.size();
             for (int32_t i = 0; i < n_block_tokens; ++i) {
                 // All mask tokens participate in attention. Only the prefix is read by the single-sequence RNN drafter.
-                const bool output = !has_rnn_context || n_seq != 1 || i < i_draft_beg + params.n_max;
+                const bool output = !has_rnn_context || n_seq != 1 || i < i_draft_beg + eff_n_max;
                 const int32_t idx = batch.add(i == 0 ? dp.id_last : mask_token_id, n + i, seq_id, output);
                 if (context) {
                     batch.set_embd_state(idx, { context, 1, (size_t) n_embd_dec });
@@ -1732,15 +1748,29 @@ public:
 
             auto & result = *dp.result;
 
+            static const std::pair<int32_t, int32_t> ctx_nmax_cfg_r = []() -> std::pair<int32_t, int32_t> {
+                const char * v = std::getenv("LLAMA_INKLING_CTX_NMAX");
+                if (!v || !v[0] || std::strcmp(v, "0") == 0) { return { 0, 0 }; }
+                if (std::strcmp(v, "1") == 0) { return { 4, 65536 }; }
+                int32_t sn = 4, th = 65536;
+                if (std::sscanf(v, "%d:%d", &sn, &th) >= 1) {
+                    return { std::max(1, sn), std::max(0, th) };
+                }
+                return { 4, 65536 };
+            }();
+            const int32_t eff_n_max = (ctx_nmax_cfg_r.first > 0 && has_rnn_context && n_seq == 1 && dp.pos0 < ctx_nmax_cfg_r.second)
+                    ? std::min(params.n_max, ctx_nmax_cfg_r.first)
+                    : params.n_max;
+
             // Inkling2 opt-in GPU argmax path exposes exact int32 token IDs via llama_get_draft_ids(),
             // avoiding 200K-vocab logit readback and host sampling.
             if (has_rnn_context && n_seq == 1) {
-                std::vector<llama_token> fast_ids((size_t) std::max<int32_t>(0, params.n_max));
-                const int32_t n_fast = llama_get_draft_ids(ctx_dft, fast_ids.data(), params.n_max);
+                std::vector<llama_token> fast_ids((size_t) std::max<int32_t>(0, eff_n_max));
+                const int32_t n_fast = llama_get_draft_ids(ctx_dft, fast_ids.data(), eff_n_max);
                 if (n_fast >= 0) {
                     const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx_dft));
                     const int32_t n_vocab = llama_vocab_n_tokens(vocab);
-                    const int32_t n_take = std::min(params.n_max, n_fast);
+                    const int32_t n_take = std::min(eff_n_max, n_fast);
                     for (int32_t k = 0; k < n_take; ++k) {
                         const llama_token id = fast_ids[(size_t) k];
                         if (id < 0 || id >= n_vocab) {
@@ -1804,7 +1834,7 @@ public:
             // DSpark: read from the first draft slot, truncate below the confidence threshold
             const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
             // bonus-anchor drafts read the mask positions only, like DFlash
-            for (int32_t i = i_draft_beg; i < i_draft_beg + params.n_max; ++i) {
+            for (int32_t i = i_draft_beg; i < i_draft_beg + eff_n_max; ++i) {
                 const int32_t idx = beg + i;
 
                 if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {

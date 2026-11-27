@@ -318,6 +318,9 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                     const char * kvs = kv_suffix(k_type, v_type);
 
                     if (n_q >= 16) {
+                        if (n_swa == 0) {
+                            ggml_metal_device_bump_inkling_fa_sparse_epoch(ctx->dev, ggml_metal_get_buffer_id(node->src[1]));
+                        }
                         char kernel[64];
                         std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_tensor_%s", kvs);
                         auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
@@ -362,63 +365,201 @@ static int ggml_metal_op_encode_impl(ggml_metal_op_t ctx, int idx) {
                             const char * m = std::getenv("GGML_METAL_INKLING_FA_DECODE_TENSOR_MIN_KV");
                             return m ? std::atoi(m) : 512;
                         }();
-                        const uint32_t nwg = n_kv <= 512u ? 1u
-                                           : (n_kv <= 4096u ? 4u
-                                           : (n_kv <= 32768u ? 16u
-                                           : (n_kv <= 65536u ? 32u
-                                           : (allow_split128 && n_kv >= 131072u ? (uint32_t)GGML_METAL_INKLING_FA_SPLIT_MAX_NWG : 64u))));
+                        static const bool quant_force_c64 = []() {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_QUANT_C64");
+                            return v && std::strcmp(v, "1") == 0;
+                        }();
+                        static const bool f16_use_c32 = []() {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_F16_C32");
+                            return v && std::strcmp(v, "1") == 0;
+                        }();
+                        static const bool force_q32 = []() {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_FORCE_Q32");
+                            return v && std::strcmp(v, "1") == 0;
+                        }();
+                        // Read sparse settings dynamically so unit tests can toggle env between graphs.
+                        const uint32_t sparse_pages = []() -> uint32_t {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_SPARSE_PAGES");
+                            if (!v || !v[0]) { return 0u; }
+                            const int x = std::atoi(v);
+                            return x > 0 ? (uint32_t) x : 0u;
+                        }();
+                        const uint32_t sparse_min_kv = []() -> uint32_t {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_SPARSE_MIN_KV");
+                            if (!v || !v[0]) { return 49152u; }
+                            const int x = std::atoi(v);
+                            return x > 0 ? (uint32_t) x : 0u;
+                        }();
+                        const uint32_t sparse_sink = []() -> uint32_t {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_SPARSE_SINK");
+                            return (v && v[0]) ? (uint32_t) std::max(0, std::atoi(v)) : 256u;
+                        }();
+                        const uint32_t sparse_local = []() -> uint32_t {
+                            const char * v = std::getenv("GGML_METAL_INKLING_FA_SPARSE_LOCAL");
+                            return (v && v[0]) ? (uint32_t) std::max(0, std::atoi(v)) : 2048u;
+                        }();
+
+                        const auto * props_dev = ggml_metal_device_get_props(ctx->dev);
+                        const bool use_tensor_dec = props_dev && props_dev->has_tensor &&
+                                n_q >= 2u && (int64_t)n_kv >= (int64_t)tensor_dec_min_kv && (n_kv % 64u) == 0u;
+
+                        const uint32_t n_pages = n_kv / 64u;
+                        const bool want_sparse = use_tensor_dec && sparse_pages > 0u &&
+                                n_swa == 0u && n_kv >= sparse_min_kv && n_pages > 1u && !quant_force_c64;
+
+                        ggml_metal_inkling_sparse_bufs sbufs = {};
+                        const bool use_sparse = want_sparse &&
+                                ggml_metal_device_get_inkling_fa_sparse(ctx->dev, ggml_metal_get_buffer_id(node->src[1]), n_pages, &sbufs);
+
+                        const uint32_t eff_kv = use_sparse ? std::min(n_kv, sparse_pages * 64u) : n_kv;
+                        const uint32_t nwg = eff_kv <= 512u ? 1u
+                                           : (eff_kv <= 4096u ? 4u
+                                           : (eff_kv <= 32768u ? 16u
+                                           : (eff_kv <= 65536u ? 32u
+                                           : (allow_split128 && eff_kv >= 131072u ? (uint32_t)GGML_METAL_INKLING_FA_SPLIT_MAX_NWG : 64u))));
                         const uint32_t has_gate = node->src[7] != nullptr ? 1u : 0u;
                         struct {
                             uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22, nwg, has_gate;
                             float scale;
-                        } args = {
+                        } scalar_args = {
                             n_q, n_kv, extent, n_swa,
                             (uint32_t)node->src[1]->nb[1], (uint32_t)node->src[1]->nb[2],
                             (uint32_t)node->src[2]->nb[1], (uint32_t)node->src[2]->nb[2],
                             nwg, has_gate, scale,
+                        };
+                        struct {
+                            uint32_t n_q, n_kv, extent, n_swa, nb11, nb12, nb21, nb22, nwg, has_gate, max_pages;
+                            float scale;
+                        } tensor_args = {
+                            n_q, n_kv, extent, n_swa,
+                            (uint32_t)node->src[1]->nb[1], (uint32_t)node->src[1]->nb[2],
+                            (uint32_t)node->src[2]->nb[1], (uint32_t)node->src[2]->nb[2],
+                            nwg, has_gate, use_sparse ? n_pages : 0u, scale,
                         };
                         ggml_metal_buffer_id bid_dst = ggml_metal_get_buffer_id(node);
                         ggml_metal_buffer_id bid_tmp = bid_dst;
                         bid_tmp.offs += GGML_PAD(ggml_nbytes(node), 64);
                         ggml_metal_buffer_id bid_gate = has_gate ? ggml_metal_get_buffer_id(node->src[7]) : bid_dst;
 
-                        const auto * props_dev = ggml_metal_device_get_props(ctx->dev);
-                        const bool use_tensor_dec = props_dev && props_dev->has_tensor &&
-                                n_q >= 2u && (int64_t)n_kv >= (int64_t)tensor_dec_min_kv && (n_kv % 64u) == 0u;
+                        auto get_fa_pipe = [&](const char * kname) {
+                            auto p = ggml_metal_library_get_pipeline(ctx->lib, kname);
+                            if (!p.pipeline) {
+                                p = ggml_metal_library_compile_pipeline(ctx->lib, kname, kname, nullptr);
+                            }
+                            GGML_ASSERT(p.pipeline);
+                            return p;
+                        };
+
+                        if (use_sparse) {
+                            // Pass 0: self-invalidating per-64-key page (k_min, k_max) summary update
+                            const char * k_upd_name = k_type == GGML_TYPE_F16  ? "kernel_inkling_fa_page_update_f16"
+                                                    : k_type == GGML_TYPE_Q8_0 ? "kernel_inkling_fa_page_update_q8_0"
+                                                                               : "kernel_inkling_fa_page_update_q4_0";
+                            auto p_upd = get_fa_pipe(k_upd_name);
+                            struct {
+                                uint32_t n_q, n_kv, n_pages, nb11, nb12, epoch;
+                            } upd_args = {
+                                n_q, n_kv, n_pages,
+                                (uint32_t)node->src[1]->nb[1], (uint32_t)node->src[1]->nb[2],
+                                sbufs.epoch,
+                            };
+                            ggml_metal_encoder_set_pipeline(ctx->enc, p_upd);
+                            ggml_metal_encoder_set_bytes(ctx->enc, &upd_args, sizeof(upd_args), 0);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[1]), 1);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[5]), 2);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[6]), 3);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_minmax, 4);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_meta,   5);
+                            ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, k_type == GGML_TYPE_F16 ? 16u : 16384u, 0);
+                            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, n_pages, 1, 1, 32, 4, 1);
+                            ggml_metal_op_concurrency_reset(ctx);
+
+                            // Pass 1A: Quest exact upper-bound page scorer across all 8 kv_heads
+                            auto p_scr = get_fa_pipe("kernel_inkling_fa_page_score");
+                            struct {
+                                uint32_t n_q, n_pages, sink_tokens, local_tokens;
+                                float scale;
+                            } scr_args = {
+                                n_q, n_pages, sparse_sink, std::max(sparse_local, extent), scale,
+                            };
+                            ggml_metal_encoder_set_pipeline(ctx->enc, p_scr);
+                            ggml_metal_encoder_set_bytes(ctx->enc, &scr_args, sizeof(scr_args), 0);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[0]), 1);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[4]), 2);
+                            ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[5]), 3);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_minmax, 4);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_meta,   5);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_scores, 6);
+                            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_pages + 15u) / 16u, 8, 1, 32, 4, 1);
+                            ggml_metal_op_concurrency_reset(ctx);
+
+                            // Pass 1B: 2-pass 256-bin radix top-K page selector
+                            auto p_top = get_fa_pipe("kernel_inkling_fa_page_topk");
+                            struct {
+                                uint32_t n_pages, k_pages;
+                            } top_args = { n_pages, sparse_pages };
+                            ggml_metal_encoder_set_pipeline(ctx->enc, p_top);
+                            ggml_metal_encoder_set_bytes(ctx->enc, &top_args, sizeof(top_args), 0);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.page_scores,  1);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.active_pages, 2);
+                            ggml_metal_encoder_set_buffer(ctx->enc, sbufs.active_count, 3);
+                            ggml_metal_encoder_dispatch_threadgroups(ctx->enc, 8, 1, 1, 256, 1, 1);
+                            ggml_metal_op_concurrency_reset(ctx);
+                        }
 
                         if (use_tensor_dec) {
                             const bool both_f16 = (k_type == GGML_TYPE_F16 && v_type == GGML_TYPE_F16);
-                            const uint32_t Q  = (both_f16 && n_q > 5u) ? 32u : 16u;
-                            const uint32_t bq = Q / 3u; // 5 for Q=16, 10 for Q=32
-                            const size_t smem = ggml_metal_inkling_fa_tensor_smem(Q, !both_f16);
-                            char kernel[64];
-                            std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_tensor_%s_q%u", kvs, Q);
-                            auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
-                            if (!pipeline.pipeline) {
-                                pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
+                            uint32_t C = 64u;
+                            uint32_t Q = 16u;
+                            if (both_f16) {
+                                if (!use_sparse && f16_use_c32 && n_q <= 5u) {
+                                    C = 32u; Q = 16u;
+                                } else if (n_q <= 5u) {
+                                    Q = 16u;
+                                } else if (n_q <= 8u && !force_q32) {
+                                    Q = 24u;
+                                } else {
+                                    Q = 32u;
+                                }
+                            } else {
+                                // Q=16 C=32 (15.8 KB smem -> 2 TGs/core) beats Q=24 C=32 (19.4 KB -> 1 TG/core) by ~25%.
+                                C = (!use_sparse && quant_force_c64) ? 64u : 32u;
+                                Q = 16u;
                             }
-                            GGML_ASSERT(pipeline.pipeline);
+                            const uint32_t bq = Q / 3u; // 5 for Q=16, 8 for Q=24, 10 for Q=32
+                            const size_t smem = ggml_metal_inkling_fa_decode_tensor_smem(Q, C, !both_f16);
+                            char kernel[96];
+                            if (use_sparse) {
+                                if (both_f16) {
+                                    std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_tensor_sparse_f16_q%u", Q);
+                                } else {
+                                    std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_tensor_sparse_%s_c32_q%u", kvs, Q);
+                                }
+                            } else if (C == 32u) {
+                                std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_tensor_%s_c32_q%u", kvs, Q);
+                            } else {
+                                std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_tensor_%s_q%u", kvs, Q);
+                            }
+                            auto pipeline = get_fa_pipe(kernel);
                             ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
-                            ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                            ggml_metal_encoder_set_bytes(ctx->enc, &tensor_args, sizeof(tensor_args), 0);
                             for (int i = 0; i < 7; ++i) {
                                 ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[i]), 1 + i);
                             }
                             ggml_metal_encoder_set_buffer(ctx->enc, bid_dst, 8);
                             ggml_metal_encoder_set_buffer(ctx->enc, bid_tmp, 9);
                             ggml_metal_encoder_set_buffer(ctx->enc, bid_gate, 10);
+                            ggml_metal_encoder_set_buffer(ctx->enc, use_sparse ? sbufs.active_pages : bid_dst, 11);
+                            ggml_metal_encoder_set_buffer(ctx->enc, use_sparse ? sbufs.active_count : bid_dst, 12);
                             ggml_metal_encoder_set_threadgroup_memory_size(ctx->enc, smem, 0);
                             ggml_metal_encoder_dispatch_threadgroups(ctx->enc, (n_q + bq - 1) / bq, 8, nwg, 32, 4, 1);
                         } else {
                             const uint32_t bq = n_q <= max_bq ? n_q : max_bq;
                             char kernel[64];
                             std::snprintf(kernel, sizeof(kernel), "kernel_inkling_fa_decode_%s_q%u", kvs, bq);
-                            auto pipeline = ggml_metal_library_get_pipeline(ctx->lib, kernel);
-                            if (!pipeline.pipeline) {
-                                pipeline = ggml_metal_library_compile_pipeline(ctx->lib, kernel, kernel, nullptr);
-                            }
-                            GGML_ASSERT(pipeline.pipeline);
+                            auto pipeline = get_fa_pipe(kernel);
                             ggml_metal_encoder_set_pipeline(ctx->enc, pipeline);
-                            ggml_metal_encoder_set_bytes(ctx->enc, &args, sizeof(args), 0);
+                            ggml_metal_encoder_set_bytes(ctx->enc, &scalar_args, sizeof(scalar_args), 0);
                             for (int i = 0; i < 7; ++i) {
                                 ggml_metal_encoder_set_buffer(ctx->enc, ggml_metal_get_buffer_id(node->src[i]), 1 + i);
                             }
